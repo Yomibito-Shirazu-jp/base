@@ -4,13 +4,13 @@ import {
   Play,
   RefreshCw,
   ShieldCheck,
-  AlertTriangle,
   ArrowRight,
   Coins,
 } from 'lucide-react';
 import type { Hex } from 'viem';
 import {
   NetworkConfig,
+  TeeZkProofInspection,
   VerifiedTransactionResult,
   WithdrawalInfo,
   WithdrawalSimulationResult,
@@ -23,6 +23,7 @@ import {
   formatSecondsJapanese,
   getProveLifecycleBadgeText,
   getWithdrawalStatusLabel,
+  inspectLatestDisputeGameTeeZk,
   simulateWithdrawalOnL1,
 } from '../lib/withdrawalAnalyzer';
 import { formatUnixTimestamp, shortenHex } from '../lib/exportUtils';
@@ -43,8 +44,11 @@ export function WithdrawalSimulatorSection({
   const [isAnalyzingTx, setIsAnalyzingTx] = useState(false);
   const [isLoadingSample, setIsLoadingSample] = useState(false);
   const [txError, setTxError] = useState<string | null>(null);
-  const [withdrawalInfo, setWithdrawalInfo] = useState<WithdrawalInfo | null>(null);
-  const [simResult, setSimResult] = useState<WithdrawalSimulationResult | null>(null);
+  const [withdrawalInfo, setWithdrawalInfo] = useState<WithdrawalInfo | null>(
+    null
+  );
+  const [simResult, setSimResult] =
+    useState<WithdrawalSimulationResult | null>(null);
 
   // Live 1-second tick for real-time remaining countdown
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -54,14 +58,22 @@ export function WithdrawalSimulatorSection({
   }, []);
 
   // Live on-chain conditions for interactive what-if simulator
-  const [conditions, setConditions] = useState<LiveWithdrawalConditions | null>(null);
+  const [conditions, setConditions] =
+    useState<LiveWithdrawalConditions | null>(null);
   const [isLoadingConditions, setIsLoadingConditions] = useState(false);
+  const [latestTeeZk, setLatestTeeZk] = useState<TeeZkProofInspection | null>(
+    null
+  );
+  const [isCheckingLatestTeeZk, setIsCheckingLatestTeeZk] = useState(false);
+  const [simProofMode, setSimProofMode] = useState<'single-5d' | 'dual-1d'>(
+    'single-5d'
+  );
   const [simAssetType, setSimAssetType] = useState<'ETH' | 'ERC20'>('ETH');
   const [simTokenSymbol, setSimTokenSymbol] = useState('USDC');
   const [simAmount, setSimAmount] = useState('1.0');
   const [simL1GweiOverride, setSimL1GweiOverride] = useState('');
   const [simProposalMinutes, setSimProposalMinutes] = useState('30');
-  const [simUsePimlicoSponsor, setSimUsePimlicoSponsor] = useState(false);
+  const [simUsePimlicoSponsor, setSimUsePimlicoSponsor] = useState(true);
 
   const loadConditions = useCallback(async () => {
     if (networkConfig.rpcUrls.length === 0) return;
@@ -69,6 +81,14 @@ export function WithdrawalSimulatorSection({
     try {
       const cond = await fetchLiveWithdrawalConditions(networkConfig);
       setConditions(cond);
+      if (cond.latestGameTeeZk) {
+        setLatestTeeZk(cond.latestGameTeeZk);
+        setSimProofMode(
+          cond.latestGameTeeZk.windowMode === 'dual-1d'
+            ? 'dual-1d'
+            : 'single-5d'
+        );
+      }
       if (!simL1GweiOverride) {
         setSimL1GweiOverride(cond.l1GasPriceGwei);
       }
@@ -88,11 +108,28 @@ export function WithdrawalSimulatorSection({
     loadConditions();
   }, [loadConditions]);
 
+  const handleCheckLatestNetworkTeeZk = async () => {
+    setIsCheckingLatestTeeZk(true);
+    try {
+      const inspected = await inspectLatestDisputeGameTeeZk(networkConfig);
+      setLatestTeeZk(inspected);
+      setSimProofMode(
+        inspected.windowMode === 'dual-1d' ? 'dual-1d' : 'single-5d'
+      );
+    } catch {
+      // Ignore error if RPC unreachable
+    } finally {
+      setIsCheckingLatestTeeZk(false);
+    }
+  };
+
   const runTxAnalysisAndSimulation = useCallback(
     async (hashToRun: string) => {
       const cleaned = hashToRun.trim();
       if (!/^0x[0-9a-fA-F]{64}$/.test(cleaned)) {
-        setTxError('有効な64桁のトランザクションハッシュ (0x...) を入力してください');
+        setTxError(
+          '有効な64桁のトランザクションハッシュ (0x...) を入力してください'
+        );
         return;
       }
 
@@ -100,7 +137,10 @@ export function WithdrawalSimulatorSection({
       setTxError(null);
 
       try {
-        const info = await analyzeWithdrawalFromTxHash(cleaned as Hex, networkConfig);
+        const info = await analyzeWithdrawalFromTxHash(
+          cleaned as Hex,
+          networkConfig
+        );
         if (!info) {
           setWithdrawalInfo(null);
           setSimResult(null);
@@ -171,7 +211,7 @@ export function WithdrawalSimulatorSection({
     );
   }, [withdrawalInfo, nowMs]);
 
-  // Interactive what-if simulator math using BOTH DisputeGame resolution (~5 days) and Proof Maturity (1 day)
+  // Interactive what-if simulator math supporting BOTH Single Proof (5 days) and TEE + ZK Dual Proof (1 day)
   const whatIfSimulation = useMemo(() => {
     const parsedAmount = Number(simAmount);
     const amountValid = Number.isFinite(parsedAmount) && parsedAmount >= 0;
@@ -182,7 +222,6 @@ export function WithdrawalSimulatorSection({
     const proveGas = conditions?.estimatedProveGas ?? 290000;
     const finalizeGas = conditions?.estimatedFinalizeGas ?? 230000;
 
-    // 1 Gwei = 1e-9 ETH
     const rawProveCostEth = proveGas * validGwei * 1e-9;
     const rawFinalizeCostEth = finalizeGas * validGwei * 1e-9;
     const proveCostEth = simUsePimlicoSponsor ? 0 : rawProveCostEth;
@@ -191,12 +230,13 @@ export function WithdrawalSimulatorSection({
     const rawTotalL1GasEth = rawProveCostEth + rawFinalizeCostEth;
 
     const maturitySec = conditions?.proofMaturityDelaySeconds ?? 86400;
+    const fast1dSec = conditions?.fastFinalizationDelaySeconds ?? 86400;
+    const slow5dSec = conditions?.slowFinalizationDelaySeconds ?? 432000;
     const gameResolutionSec =
-      conditions?.disputeGameResolutionSeconds ?? 432000;
+      simProofMode === 'dual-1d' ? fast1dSec : slow5dSec;
     const gameFinalityDelaySec =
       conditions?.disputeGameFinalityDelaySeconds ?? 0;
 
-    // Crucial OP Stack v6 rule: post-Prove wait is max(DisputeGame resolution + finalityDelay, proofMaturityDelay)
     const postProveWaitSec = Math.max(
       gameResolutionSec + gameFinalityDelaySec,
       maturitySec
@@ -222,6 +262,8 @@ export function WithdrawalSimulatorSection({
       totalL1GasEth,
       rawTotalL1GasEth,
       maturitySec,
+      fast1dSec,
+      slow5dSec,
       gameResolutionSec,
       gameFinalityDelaySec,
       postProveWaitSec,
@@ -236,6 +278,7 @@ export function WithdrawalSimulatorSection({
     simL1GweiOverride,
     simProposalMinutes,
     simAssetType,
+    simProofMode,
     simUsePimlicoSponsor,
     conditions,
     nowMs,
@@ -243,15 +286,19 @@ export function WithdrawalSimulatorSection({
 
   return (
     <div className="space-y-6">
-      {/* Section 1: Real On-Chain Withdrawal Inspector, Prove Status & Direct L1 Execution */}
+      {/* Section 1: Real On-Chain Withdrawal Inspector, TEE/ZK Check, 2-Step Simulation & Receive Funds */}
       <section className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
           <div>
             <h2 className="text-base font-bold text-slate-900">
-              実トランザクション Prove状態チェック・L1ドライラン・そのまま出金確定 (Pimlico対応)
+              実トランザクション TEE/ZKチェック・2段階シミュレーション・L1資金受け取り
             </h2>
-            <p className="mt-1 text-xs text-slate-600">
-              Base の出金トランザクションハッシュを入力すると、L2 MessagePasser・Prove状態・DisputeGame解決残り時間を実測し、そのまま Pimlico (RPC / API Key / Policy ID) またはウォレットで Prove / Finalize を実行できます。
+            <p className="mt-1 text-xs text-slate-600 leading-relaxed">
+              Base の出金Txハッシュを入力すると、出金ゲームの{' '}
+              <strong>TEE / ZK 証明状態（単一証明: 5日 / 両方あり: 1日）</strong>・
+              <span className="font-mono">proveWithdrawalTransaction</span> ＆ 成熟待機後の{' '}
+              <span className="font-mono">finalizeWithdrawalTransaction</span>{' '}
+              シミュレーションを実行し、そのまま <strong>「資金を受け取る」</strong> ボタンで着金できます。
             </p>
           </div>
           <button
@@ -260,15 +307,21 @@ export function WithdrawalSimulatorSection({
             disabled={isLoadingSample || isAnalyzingTx}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSample ? 'animate-spin' : ''}`} />
-            <span>{isLoadingSample ? '検索中...' : '最新出金Txをオンチェーン取得'}</span>
+            <RefreshCw
+              className={`w-3.5 h-3.5 ${isLoadingSample ? 'animate-spin' : ''}`}
+            />
+            <span>
+              {isLoadingSample ? '検索中...' : '最新出金Txをオンチェーン取得'}
+            </span>
           </button>
         </div>
 
         {/* Detected withdrawal shortcuts from batch / withdrawal tables */}
         {verifiedWithdrawals.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="text-slate-500 font-medium">検証済みの出金Txを選択:</span>
+            <span className="text-slate-500 font-medium">
+              検証済みの出金Txを選択:
+            </span>
             {verifiedWithdrawals.map((item) => (
               <button
                 key={item.hash}
@@ -309,12 +362,12 @@ export function WithdrawalSimulatorSection({
             {isAnalyzingTx ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin" />
-                <span>Prove状態・L1検証中...</span>
+                <span>TEE/ZK・2段階シミュ実行中...</span>
               </>
             ) : (
               <>
                 <Play className="w-4 h-4 fill-current" />
-                <span>Prove状態チェック・出金画面を開く</span>
+                <span>検証 ＆ 資金受け取り画面を開く</span>
               </>
             )}
           </button>
@@ -333,7 +386,7 @@ export function WithdrawalSimulatorSection({
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                   <Coins className="w-3.5 h-3.5" />
-                  <span>出金金額・アセット</span>
+                  <span>受取予定金額・アセット</span>
                 </div>
                 <div className="mt-1.5 text-xl font-bold font-mono tabular-nums text-slate-900">
                   {withdrawalInfo.amountFormatted} {withdrawalInfo.assetSymbol}
@@ -346,37 +399,44 @@ export function WithdrawalSimulatorSection({
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                   <Clock className="w-3.5 h-3.5" />
-                  <span>出金確定 (Finalize) まで残り</span>
+                  <span>資金受け取りまで残り</span>
                 </div>
                 <div
                   className={`mt-1.5 text-xl font-bold font-mono tabular-nums ${
-                    liveRemainingSeconds === 0 ? 'text-emerald-700' : 'text-amber-700'
+                    liveRemainingSeconds === 0
+                      ? 'text-emerald-700'
+                      : 'text-amber-700'
                   }`}
                 >
                   {formatSecondsJapanese(liveRemainingSeconds)}
                 </div>
                 <div className="mt-1 text-xs text-slate-500 font-mono tabular-nums">
-                  {withdrawalInfo.estimatedClaimableAtMs && liveRemainingSeconds !== 0
+                  {withdrawalInfo.estimatedClaimableAtMs &&
+                  liveRemainingSeconds !== 0
                     ? `予定: ${formatUnixTimestamp(
                         Math.floor(withdrawalInfo.estimatedClaimableAtMs / 1000)
                       )}`
                     : withdrawalInfo.portalFinalized
-                    ? 'L1 着金完了済'
-                    : '今すぐ Claim 実行可能'}
+                    ? 'L1 資金受取完了済'
+                    : '今すぐ資金受け取り可能'}
                 </div>
               </div>
 
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                   <ShieldCheck className="w-3.5 h-3.5" />
-                  <span>現在のステージ / Prove状態</span>
+                  <span>ステージ / ゲーム待機枠</span>
                 </div>
                 <div className="mt-1.5 text-sm font-bold text-slate-900">
                   {getWithdrawalStatusLabel(withdrawalInfo.status)}
                 </div>
                 <div className="mt-1 text-xs text-[#0052FF] font-medium truncate">
-                  {withdrawalInfo.validation
-                    ? getProveLifecycleBadgeText(withdrawalInfo.validation.proveState)
+                  {withdrawalInfo.validation?.teeZk?.windowMode === 'dual-1d'
+                    ? 'TEE+ZK 二重証明 (1日枠)'
+                    : withdrawalInfo.validation
+                    ? `${getProveLifecycleBadgeText(
+                        withdrawalInfo.validation.proveState
+                      )} · 単一5日枠`
                     : '—'}
                 </div>
               </div>
@@ -391,225 +451,157 @@ export function WithdrawalSimulatorSection({
                 <div className="mt-1 text-xs text-slate-600 font-mono tabular-nums truncate">
                   {simResult?.netAmountFormatted
                     ? `実質: ${simResult.netAmountFormatted}`
-                    : 'Pimlico Policy指定時はガス0 ETH可'}
+                    : 'Paymaster適用時はガス負担0 ETH可'}
                 </div>
               </div>
             </div>
 
-            {/* L1 Contract Dry-Run Simulation Result */}
-            {simResult && (
-              <div
-                className={`border rounded-xl p-4 flex flex-col gap-2 ${
-                  simResult.l1DryRunSuccess
-                    ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
-                    : 'bg-amber-50/70 border-amber-200 text-amber-950'
-                }`}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-sm font-semibold">
-                    {simResult.l1DryRunSuccess ? (
-                      <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />
-                    ) : (
-                      <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
-                    )}
-                    <span>
-                      Ethereum L1 OptimismPortal2 ({simResult.l1DryRunAction}) ＆ 待機後着金ドライラン
-                    </span>
-                  </div>
-                  <span className="text-xs font-mono tabular-nums text-slate-600">
-                    L1 GasPrice: {simResult.l1GasPriceGwei} Gwei · Prove推定:{' '}
-                    {simResult.estimatedProveFeeEth} ETH · Finalize推定:{' '}
-                    {simResult.estimatedFinalizeFeeEth} ETH
-                  </span>
-                </div>
-                <p className="text-xs leading-relaxed">{simResult.l1DryRunMessage}</p>
-              </div>
-            )}
-
-            {/* Direct L1 Prove & Finalize Execution Console (Pimlico ERC-4337 + Wallet) */}
+            {/* Unified TEE/ZK Check + 2-Step Simulation + Receive Funds Console */}
             <PimlicoExecutionPanel
               txHash={txHashInput.trim()}
               withdrawalInfo={withdrawalInfo}
               networkConfig={networkConfig}
               nowMs={nowMs}
-              onExecutionCompleted={() => runTxAnalysisAndSimulation(txHashInput)}
+              externalSimResult={simResult}
+              externalIsSimulating={isAnalyzingTx}
+              onRunExternalSimulation={() =>
+                runTxAnalysisAndSimulation(txHashInput)
+              }
+              onWithdrawalUpdated={(updated) => setWithdrawalInfo(updated)}
+              onExecutionCompleted={() =>
+                runTxAnalysisAndSimulation(txHashInput)
+              }
             />
           </div>
         )}
       </section>
 
-      {/* Section 2: Accurate Dual-Window New Withdrawal Timeline & Net Amount Simulator */}
+      {/* Section 2: New Withdrawal Timeline & Net Amount Simulator (5-Day Single Proof vs 1-Day TEE+ZK Dual Proof) */}
       <section className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
-        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 pb-4 border-b border-slate-100">
+        <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3 pb-4 border-b border-slate-100">
           <div className="space-y-1.5">
             <h2 className="text-base font-bold text-slate-900">
-              新規出金 タイムライン＆実質受取額シミュレーター（2段階ロック実測対応）
+              新規出金 タイムライン＆実質受取額シミュレーター（単一証明5日 ／ TEE+ZK二重証明1日 対応）
             </h2>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Ethereum L1 の最新{' '}
+              Base L1 の{' '}
               <span className="font-mono text-slate-800">
-                OptimismPortal2{conditions?.portalVersion ? ` v${conditions.portalVersion}` : ''}
+                AggregateVerifier (GameType {conditions?.respectedGameType ?? 621})
               </span>{' '}
-              では、出金確定までに{' '}
+              では、出金ゲームの待機期間は{' '}
               <strong className="text-slate-900">
-                ① DisputeGame解決期間（GameType {conditions?.respectedGameType ?? 621} 実測:{' '}
-                {conditions
-                  ? `${conditions.disputeGameResolutionSeconds.toLocaleString()}秒 = ${formatSecondsJapanese(
-                      conditions.disputeGameResolutionSeconds
-                    )}`
-                  : '取得中...'}
-                ）
+                単一証明（TEEのみ / ZKのみ）で{' '}
+                {formatSecondsJapanese(whatIfSimulation.slow5dSec)}（
+                {whatIfSimulation.slow5dSec.toLocaleString()}秒）
+              </strong>
+              、
+              <strong className="text-emerald-800">
+                TEE と ZK の両方がある場合は{' '}
+                {formatSecondsJapanese(whatIfSimulation.fast1dSec)}（
+                {whatIfSimulation.fast1dSec.toLocaleString()}秒）
               </strong>{' '}
-              と{' '}
-              <strong className="text-slate-900">
-                ② Prove提出後の成熟遅延（
-                {conditions
-                  ? `${conditions.proofMaturityDelaySeconds.toLocaleString()}秒 = ${formatSecondsJapanese(
-                      conditions.proofMaturityDelaySeconds
-                    )}`
-                  : '取得中...'}
-                ）
-              </strong>{' '}
-              の<strong>両方の経過（長い方＝実質 約5日間）</strong>が必要です。
+              です（加えて Prove 提出から{' '}
+              {formatSecondsJapanese(whatIfSimulation.maturitySec)}{' '}
+              の成熟期間が並行して経過する必要があります）。
             </p>
-            {conditions && (
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-medium text-slate-500">
-                <span>信頼性・参照ソース:</span>
-                <span
-                  className={
-                    conditions.usedFallbackDelay ? 'text-amber-700' : 'text-emerald-700'
-                  }
-                >
-                  {conditions.usedFallbackDelay
-                    ? '一部フォールバック値使用'
-                    : 'L1 OptimismPortal2 & DisputeGameFactory 解決履歴実測値'}
+
+            {latestTeeZk && (
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-700 pt-0.5">
+                <span className="font-semibold text-slate-900">
+                  現在のL1最新ゲーム実測 (#{latestTeeZk.disputeGameIndex ?? '—'}):
+                </span>
+                <span>
+                  TEE証明={latestTeeZk.hasTeeProof ? 'あり' : 'なし'}
                 </span>
                 <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums">
-                  直近Game提案間隔: 約{Math.max(1, Math.round(conditions.proposalIntervalSeconds / 60))}分
+                <span>
+                  ZK証明={latestTeeZk.hasZkProof ? 'あり' : 'なし'}
                 </span>
-                {conditions.rawMeasuredResolutionSeconds !== null && (
-                  <>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono tabular-nums">
-                      Game解決実測(resolvedAt-createdAt):{' '}
-                      {conditions.rawMeasuredResolutionSeconds.toLocaleString()}秒
-                    </span>
-                  </>
-                )}
+                <span aria-hidden="true">·</span>
+                <span
+                  className={`font-semibold ${
+                    latestTeeZk.windowMode === 'dual-1d'
+                      ? 'text-emerald-700'
+                      : 'text-[#0052FF]'
+                  }`}
+                >
+                  現在 {latestTeeZk.proofCount}/2 証明 →{' '}
+                  {latestTeeZk.windowMode === 'dual-1d'
+                    ? '1日高速枠で稼働中'
+                    : '5日単一証明枠で稼働中'}
+                </span>
               </div>
             )}
           </div>
-          <button
-            type="button"
-            onClick={loadConditions}
-            disabled={isLoadingConditions}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${isLoadingConditions ? 'animate-spin' : ''}`} />
-            <span>最新オンチェーン設定を再取得</span>
-          </button>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleCheckLatestNetworkTeeZk}
+              disabled={isCheckingLatestTeeZk || isLoadingConditions}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#0052FF] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${
+                  isCheckingLatestTeeZk ? 'animate-spin' : ''
+                }`}
+              />
+              <span>
+                {isCheckingLatestTeeZk
+                  ? 'TEE / ZK 照会中...'
+                  : '最新ゲームの TEE / ZK チェック'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={loadConditions}
+              disabled={isLoadingConditions}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${
+                  isLoadingConditions ? 'animate-spin' : ''
+                }`}
+              />
+              <span>オンチェーン設定再取得</span>
+            </button>
+          </div>
         </div>
 
-        {/* Inputs */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 items-end">
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1.5">
-              出金アセット種別
-            </label>
-            <div className="inline-flex w-full p-1 bg-slate-100 rounded-lg">
-              <button
-                type="button"
-                onClick={() => setSimAssetType('ETH')}
-                className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                  simAssetType === 'ETH'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Native ETH
-              </button>
-              <button
-                type="button"
-                onClick={() => setSimAssetType('ERC20')}
-                className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                  simAssetType === 'ERC20'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                ERC-20
-              </button>
+        {/* Proof Window Mode Selector + Inputs */}
+        <div className="space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <span className="block text-xs font-medium text-slate-700">
+                シミュレーションする出金ゲームの証明条件（TEE / ZK）
+              </span>
+              <div className="inline-flex flex-wrap p-1 bg-slate-100 rounded-lg gap-1">
+                <button
+                  type="button"
+                  onClick={() => setSimProofMode('single-5d')}
+                  className={`px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                    simProofMode === 'single-5d'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  単一証明（TEEのみ / ZKのみ）: 5日 (432,000秒)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSimProofMode('dual-1d')}
+                  className={`px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                    simProofMode === 'dual-1d'
+                      ? 'bg-white text-emerald-700 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  TEE + ZK 両方あり（二重証明）: 1日 (86,400秒)
+                </button>
+              </div>
             </div>
-          </div>
 
-          <div>
-            <label
-              htmlFor="sim-amount-input"
-              className="block text-xs font-medium text-slate-700 mb-1.5"
-            >
-              出金額 ({simAssetType === 'ETH' ? 'ETH' : simTokenSymbol || 'Token'})
-            </label>
-            <div className="flex gap-2">
-              <input
-                id="sim-amount-input"
-                type="number"
-                min="0"
-                step="any"
-                value={simAmount}
-                onChange={(e) => setSimAmount(e.target.value)}
-                className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
-              />
-              {simAssetType === 'ERC20' && (
-                <input
-                  type="text"
-                  value={simTokenSymbol}
-                  onChange={(e) => setSimTokenSymbol(e.target.value)}
-                  aria-label="トークンシンボル"
-                  className="w-24 px-2.5 py-2 text-sm font-mono bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
-                />
-              )}
-            </div>
-          </div>
-
-          <div>
-            <label
-              htmlFor="sim-l1-gwei"
-              className="block text-xs font-medium text-slate-700 mb-1.5"
-            >
-              想定 L1 ガス価格 (Gwei)
-            </label>
-            <input
-              id="sim-l1-gwei"
-              type="number"
-              min="0"
-              step="0.01"
-              value={simL1GweiOverride}
-              onChange={(e) => setSimL1GweiOverride(e.target.value)}
-              placeholder={conditions?.l1GasPriceGwei ?? '1.0'}
-              className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
-            />
-          </div>
-
-          <div>
-            <label
-              htmlFor="sim-proposal-min"
-              className="block text-xs font-medium text-slate-700 mb-1.5"
-            >
-              L1 DisputeGame 提案待機 (分)
-            </label>
-            <input
-              id="sim-proposal-min"
-              type="number"
-              min="0"
-              step="5"
-              value={simProposalMinutes}
-              onChange={(e) => setSimProposalMinutes(e.target.value)}
-              className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
-            />
-          </div>
-
-          <div className="pb-2">
             <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer select-none">
               <input
                 type="checkbox"
@@ -617,8 +609,106 @@ export function WithdrawalSimulatorSection({
                 onChange={(e) => setSimUsePimlicoSponsor(e.target.checked)}
                 className="rounded border-slate-300 text-[#0052FF] focus:ring-[#0052FF]"
               />
-              <span>Pimlico Paymaster スポンサー適用</span>
+              <span>Paymaster (Pimlico / Alchemy) スポンサー適用</span>
             </label>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                出金アセット種別
+              </label>
+              <div className="inline-flex w-full p-1 bg-slate-100 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => setSimAssetType('ETH')}
+                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                    simAssetType === 'ETH'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Native ETH
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSimAssetType('ERC20')}
+                  className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                    simAssetType === 'ERC20'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  ERC-20
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <label
+                htmlFor="sim-amount-input"
+                className="block text-xs font-medium text-slate-700 mb-1.5"
+              >
+                出金額 ({simAssetType === 'ETH' ? 'ETH' : simTokenSymbol || 'Token'})
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="sim-amount-input"
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={simAmount}
+                  onChange={(e) => setSimAmount(e.target.value)}
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
+                />
+                {simAssetType === 'ERC20' && (
+                  <input
+                    type="text"
+                    value={simTokenSymbol}
+                    onChange={(e) => setSimTokenSymbol(e.target.value)}
+                    aria-label="トークンシンボル"
+                    className="w-24 px-2.5 py-2 text-sm font-mono bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
+                  />
+                )}
+              </div>
+            </div>
+
+            <div>
+              <label
+                htmlFor="sim-l1-gwei"
+                className="block text-xs font-medium text-slate-700 mb-1.5"
+              >
+                想定 L1 ガス価格 (Gwei)
+              </label>
+              <input
+                id="sim-l1-gwei"
+                type="number"
+                min="0"
+                step="0.01"
+                value={simL1GweiOverride}
+                onChange={(e) => setSimL1GweiOverride(e.target.value)}
+                placeholder={conditions?.l1GasPriceGwei ?? '1.0'}
+                className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="sim-proposal-min"
+                className="block text-xs font-medium text-slate-700 mb-1.5"
+              >
+                L1 DisputeGame 提案待機 (分)
+              </label>
+              <input
+                id="sim-proposal-min"
+                type="number"
+                min="0"
+                step="5"
+                value={simProposalMinutes}
+                onChange={(e) => setSimProposalMinutes(e.target.value)}
+                className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
+              />
+            </div>
           </div>
         </div>
 
@@ -627,7 +717,7 @@ export function WithdrawalSimulatorSection({
           <div className="p-4 grid grid-cols-1 md:grid-cols-4 gap-4 items-start">
             <div>
               <div className="text-xs text-slate-500">
-                新規出金の総所要時間 (L2実行→L1受取)
+                新規出金の総所要時間 (L2開始→資金受取)
               </div>
               <div className="mt-1 text-xl font-bold font-mono tabular-nums text-slate-900">
                 {formatSecondsJapanese(whatIfSimulation.totalWaitSec)}
@@ -639,18 +729,26 @@ export function WithdrawalSimulatorSection({
 
             <div>
               <div className="text-xs text-slate-500">
-                待機内訳 (長い方の完了が必須)
+                待機内訳 ({simProofMode === 'dual-1d' ? 'TEE+ZK 二重証明' : '単一証明'})
               </div>
               <div className="mt-1 text-xs font-mono tabular-nums text-slate-900 space-y-0.5">
                 <div>
-                  ・Game解決: <strong>{formatSecondsJapanese(whatIfSimulation.gameResolutionSec)}</strong>
+                  ・出金ゲーム待機:{' '}
+                  <strong>
+                    {formatSecondsJapanese(whatIfSimulation.gameResolutionSec)}
+                  </strong>
                 </div>
                 <div>
-                  ・Prove後成熟: <strong>{formatSecondsJapanese(whatIfSimulation.maturitySec)}</strong>
+                  ・Prove後成熟:{' '}
+                  <strong>
+                    {formatSecondsJapanese(whatIfSimulation.maturitySec)}
+                  </strong>
                 </div>
               </div>
               <div className="mt-0.5 text-[11px] text-slate-500">
-                ※5日経過後に遅れてProveした場合はProve後1日で確定可
+                {simProofMode === 'dual-1d'
+                  ? 'TEE+ZK両方揃うためProve後1日で資金受取可'
+                  : '単一証明のためゲーム解決5日間が律速'}
               </div>
             </div>
 
@@ -663,8 +761,12 @@ export function WithdrawalSimulatorSection({
               </div>
               <div className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
                 {simUsePimlicoSponsor
-                  ? `Paymaster負担 (実費相当 ${whatIfSimulation.rawTotalL1GasEth.toFixed(6)} ETH)`
-                  : `Prove ${whatIfSimulation.proveCostEth.toFixed(6)} + Finalize ${whatIfSimulation.finalizeCostEth.toFixed(6)} ETH`}
+                  ? `Paymaster負担 (実費相当 ${whatIfSimulation.rawTotalL1GasEth.toFixed(
+                      6
+                    )} ETH)`
+                  : `Prove ${whatIfSimulation.proveCostEth.toFixed(
+                      6
+                    )} + Finalize ${whatIfSimulation.finalizeCostEth.toFixed(6)} ETH`}
               </div>
             </div>
 
@@ -679,39 +781,41 @@ export function WithdrawalSimulatorSection({
               </div>
               <div className="mt-0.5 text-xs text-slate-500">
                 {simUsePimlicoSponsor
-                  ? 'Pimlico Sponsorship Policy により L1 ガス代控除なし'
+                  ? 'Paymaster Policy により L1 ガス代控除なし'
                   : simAssetType === 'ETH'
                   ? '出金額から L1 Prove/Finalize ガス代を控除'
-                  : `別途 L1 ガス代 ${whatIfSimulation.totalL1GasEth.toFixed(6)} ETH が必要`}
+                  : `別途 L1 ガス代 ${whatIfSimulation.totalL1GasEth.toFixed(
+                      6
+                    )} ETH が必要`}
               </div>
             </div>
           </div>
 
           <div className="p-4 bg-slate-50/70 flex flex-col xl:flex-row items-start xl:items-center justify-between gap-3 text-xs">
             <div className="flex flex-wrap items-center gap-2 text-slate-700">
-              <span className="font-semibold text-slate-900">1. Base L2 出金開始</span>
+              <span className="font-semibold text-slate-900">
+                1. Base L2 出金開始
+              </span>
               <span className="font-mono tabular-nums text-slate-500">
                 ({formatUnixTimestamp(Math.floor(nowMs / 1000))})
               </span>
               <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-              <span className="font-semibold text-slate-900">2. L1 Prove 実行可能</span>
+              <span className="font-semibold text-slate-900">
+                2. L1 Prove 提出可能
+              </span>
               <span className="font-mono tabular-nums text-slate-500">
                 ({formatUnixTimestamp(whatIfSimulation.proveReadyAtSec)})
               </span>
               <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-              <span className="text-slate-600">
-                [Prove1日成熟: {formatUnixTimestamp(whatIfSimulation.proveMaturityDoneAtSec)}]
-              </span>
-              <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
               <span className="font-semibold text-emerald-700">
-                3. Game解決＆L1 Finalize可能
+                3. 資金を受け取る ({simProofMode === 'dual-1d' ? '1日後' : '5日後'})
               </span>
               <span className="font-mono tabular-nums text-emerald-700">
                 ({formatUnixTimestamp(whatIfSimulation.claimableAtSec)})
               </span>
             </div>
             <span className="text-slate-500 font-mono tabular-nums shrink-0">
-              L2 Base Gas: {conditions?.l2GasPriceGwei ?? '—'} Gwei · L1 Gas:{' '}
+              L2 Gas: {conditions?.l2GasPriceGwei ?? '—'} Gwei · L1 Gas:{' '}
               {conditions?.l1GasPriceGwei ?? '—'} Gwei
             </span>
           </div>

@@ -261,9 +261,10 @@ export function WithdrawalVerificationSection({
             </h2>
             <p className="mt-1 text-xs text-slate-600 leading-relaxed">
               Base の <span className="font-mono text-slate-800">L2ToL1MessagePasser</span>{' '}
-              イベントと Ethereum L1 の{' '}
-              <span className="font-mono text-slate-800">OptimismPortal2.finalizedWithdrawals</span>{' '}
-              を直接照会し、L1 Claim コード実行の有無・出金額・残り時間・照合根拠を一括判定します。
+              と Ethereum L1 の{' '}
+              <span className="font-mono text-slate-800">OptimismPortal2</span> /{' '}
+              <span className="font-mono text-slate-800">AggregateVerifier</span>{' '}
+              を直接照会し、<strong>TEE / ZK 証明状態（単一5日 / 両方1日）</strong>・2段階シミュレーション・<strong>資金受け取り可否</strong>を一括判定します。
             </p>
           </div>
 
@@ -432,9 +433,9 @@ export function WithdrawalVerificationSection({
               出金Txの L1 OptimismPortal2 照合結果がここに表示されます
             </h3>
             <p className="mt-2 text-sm text-slate-600 leading-relaxed">
-              L2のブロックが <span className="font-mono text-slate-800">Finalized</span> でも、L1の{' '}
-              <span className="font-mono text-slate-800">finalizeWithdrawalTransaction</span>{' '}
-              を実行するまで資産はL1へ着金しません。このタブでは L1 実行済みフラグ・出金額・残り時間を一覧で確認できます。
+              L1側で実際に資産を受け取るための <span className="font-mono text-slate-800">proveWithdrawalTransaction</span>{' '}
+              および成熟待機後の <span className="font-mono text-slate-800">finalizeWithdrawalTransaction</span>{' '}
+              シミュレーション、出金ゲームの <strong>TEE / ZK 証明チェック（単一証明5日・両方あり1日）</strong>、<strong>「資金を受け取る」</strong> 実行を行えます。
             </p>
             <div className="mt-6">
               <button
@@ -725,11 +726,17 @@ export function WithdrawalVerificationSection({
                                 </div>
                                 <div className="text-[11px] font-mono text-slate-500">
                                   {val
-                                    ? val.numProofSubmitters > 0
-                                      ? `Prove済 (${val.numProofSubmitters}件)`
-                                      : '未Prove (0件)'
+                                    ? `${
+                                        val.numProofSubmitters > 0
+                                          ? `Prove済(${val.numProofSubmitters})`
+                                          : '未Prove'
+                                      } · ${
+                                        val.teeZk?.windowMode === 'dual-1d'
+                                          ? 'TEE+ZK 1日枠'
+                                          : '単一証明 5日枠'
+                                      }`
                                     : w.portalFinalized
-                                    ? 'Claim済'
+                                    ? '資金受取済'
                                     : '未Prove'}
                                 </div>
                               </div>
@@ -822,8 +829,10 @@ export function WithdrawalVerificationSection({
                                   e.stopPropagation();
                                   onOpenInSimulator(row.hash);
                                 }}
-                                className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
-                                  w.status === 'ready-to-finalize'
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                                  w.portalFinalized
+                                    ? 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
+                                    : w.status === 'ready-to-finalize'
                                     ? 'text-white bg-emerald-600 hover:bg-emerald-700'
                                     : w.status === 'ready-to-prove'
                                     ? 'text-white bg-[#0052FF] hover:bg-blue-700'
@@ -832,11 +841,13 @@ export function WithdrawalVerificationSection({
                               >
                                 <Play className="w-3 h-3 fill-current" />
                                 <span>
-                                  {w.status === 'ready-to-finalize'
-                                    ? '出金確定へ'
+                                  {w.portalFinalized
+                                    ? '受取済・詳細'
+                                    : w.status === 'ready-to-finalize'
+                                    ? '資金を受け取る'
                                     : w.status === 'ready-to-prove'
-                                    ? 'Prove実行へ'
-                                    : 'Prove確認・実行'}
+                                    ? 'Prove・資金受取準備'
+                                    : 'TEE/ZK・資金受取'}
                                 </span>
                               </button>
                             ) : (

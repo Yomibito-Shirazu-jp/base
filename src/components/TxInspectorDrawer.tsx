@@ -8,8 +8,6 @@ import {
   Check,
   ExternalLink,
   Code2,
-  Play,
-  RefreshCw,
   ShieldAlert,
   Clock,
 } from 'lucide-react';
@@ -33,6 +31,8 @@ import {
   getWithdrawalStatusLabel,
   simulateWithdrawalOnL1,
 } from '../lib/withdrawalAnalyzer';
+import { PimlicoExecutionPanel } from './PimlicoExecutionPanel';
+import { WithdrawalInfo } from '../types/finality';
 
 interface TxInspectorDrawerProps {
   result: VerifiedTransactionResult | null;
@@ -58,12 +58,16 @@ export function TxInspectorDrawer({
   const [simResult, setSimResult] = useState<WithdrawalSimulationResult | null>(null);
   const [isSimulating, setIsSimulating] = useState(false);
   const [simError, setSimError] = useState<string | null>(null);
+  const [localWithdrawal, setLocalWithdrawal] = useState<WithdrawalInfo | null>(
+    result?.withdrawal ?? null
+  );
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     setSimResult(null);
     setSimError(null);
-  }, [result?.hash]);
+    setLocalWithdrawal(result?.withdrawal ?? null);
+  }, [result?.hash, result?.withdrawal]);
 
   useEffect(() => {
     if (!result?.withdrawal) return;
@@ -120,7 +124,7 @@ export function TxInspectorDrawer({
       aria-label="トランザクション詳細検証"
     >
       <div
-        className="w-full max-w-2xl bg-white h-full overflow-y-auto border-l border-slate-200 flex flex-col"
+        className="w-full max-w-3xl bg-white h-full overflow-y-auto border-l border-slate-200 flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -326,9 +330,9 @@ export function TxInspectorDrawer({
             </div>
           </div>
 
-          {/* L2 -> L1 Withdrawal Detail & L1 Simulation */}
-          {result.withdrawal && (() => {
-            const w = result.withdrawal;
+          {/* L2 -> L1 Withdrawal Detail, TEE/ZK Check, 2-Step Simulation & Receive Funds */}
+          {(localWithdrawal ?? result.withdrawal) && (() => {
+            const w = (localWithdrawal ?? result.withdrawal)!;
             const liveRemainingSec =
               w.status === 'ready-to-finalize' || w.status === 'finalized'
                 ? 0
@@ -339,10 +343,10 @@ export function TxInspectorDrawer({
             const val = w.validation ?? simResult?.validation;
 
             return (
-              <div>
-                <div className="flex items-center justify-between gap-2 mb-3">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-2">
                   <h4 className="text-xs font-semibold text-slate-500">
-                    L2 → L1 実出金可否・MessagePasser・出金バリデーション検証
+                    L2 → L1 実出金検証・TEE/ZK判定・資金受け取りコンソール
                   </h4>
                   {onOpenInSimulator && (
                     <button
@@ -350,7 +354,7 @@ export function TxInspectorDrawer({
                       onClick={() => onOpenInSimulator(result.hash)}
                       className="text-xs font-medium text-[#0052FF] hover:underline cursor-pointer"
                     >
-                      シミュレーター画面で開く
+                      専用シミュレーター画面で開く
                     </button>
                   )}
                 </div>
@@ -534,59 +538,25 @@ export function TxInspectorDrawer({
                     </div>
                   </div>
 
-                  <div className="pt-1 flex flex-wrap items-center gap-2.5">
-                    {onOpenInSimulator && !w.portalFinalized && (
-                      <button
-                        type="button"
-                        onClick={() => onOpenInSimulator(result.hash)}
-                        className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer"
-                      >
-                        <Play className="w-3.5 h-3.5 fill-current" />
-                        <span>Pimlico / ウォレットで Prove・出金確定へ進む</span>
-                      </button>
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={handleRunL1Sim}
-                      disabled={isSimulating}
-                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors cursor-pointer"
-                    >
-                      {isSimulating ? (
-                        <>
-                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                          <span>最新L1状態で再検証中...</span>
-                        </>
-                      ) : (
-                        <>
-                          <RefreshCw className="w-3.5 h-3.5" />
-                          <span>待機後着金・ガス代をL1再検証</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-
                   {simError && (
                     <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
                       {simError}
                     </p>
                   )}
-
-                  {simResult && (
-                    <div className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1.5">
-                      <div className="font-semibold text-slate-900">
-                        {simResult.l1DryRunMessage}
-                      </div>
-                      <div className="font-mono tabular-nums text-slate-600">
-                        L1 Gas: {simResult.l1GasPriceGwei} Gwei · 推定L1手数料:{' '}
-                        {simResult.totalL1ClaimCostEth} ETH
-                        {simResult.netAmountFormatted
-                          ? ` · 実質受取: ${simResult.netAmountFormatted}`
-                          : ''}
-                      </div>
-                    </div>
-                  )}
                 </div>
+
+                {/* Direct TEE/ZK Check + Prove & Post-Maturity Finalize Simulation + 資金を受け取る Button */}
+                <PimlicoExecutionPanel
+                  txHash={result.hash}
+                  withdrawalInfo={w}
+                  networkConfig={networkConfig}
+                  nowMs={nowMs}
+                  externalSimResult={simResult}
+                  externalIsSimulating={isSimulating}
+                  onRunExternalSimulation={handleRunL1Sim}
+                  onWithdrawalUpdated={(updated) => setLocalWithdrawal(updated)}
+                  onExecutionCompleted={handleRunL1Sim}
+                />
               </div>
             );
           })()}

@@ -9,8 +9,10 @@ import {
   type Address,
   type Hex,
 } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { entryPoint07Address } from 'viem/account-abstraction';
+import {
+  createPaymasterClient,
+  entryPoint07Address,
+} from 'viem/account-abstraction';
 import { getWithdrawals } from 'viem/op-stack';
 import { createSmartAccountClient } from 'permissionless';
 import {
@@ -26,33 +28,38 @@ import {
   inspectAggregateGameProxy,
 } from './withdrawalAnalyzer';
 
-export type ExecutionMode = 'pimlico' | 'wallet';
+export type ExecutionMode = 'pimlico' | 'alchemy' | 'wallet';
 export type SmartAccountKind = 'simple' | 'safe';
-export type SignerSource = 'injected' | 'privateKey';
 export type WithdrawalL1Action = 'prove' | 'finalize';
+
+export interface ServerAaStatus {
+  pimlicoEthConfigured: boolean;
+  pimlicoSepoliaConfigured: boolean;
+  pimlicoBaseConfigured: boolean;
+  pimlicoPolicyConfigured: boolean;
+  alchemyEthConfigured: boolean;
+  alchemySepoliaConfigured: boolean;
+  alchemyPolicyConfigured: boolean;
+}
 
 export interface PimlicoExecutionSettings {
   mode: ExecutionMode;
-  pimlicoRpcUrl: string;
-  pimlicoApiKey: string;
-  sponsorshipPolicyId: string;
   usePaymaster: boolean;
   smartAccountKind: SmartAccountKind;
-  signerSource: SignerSource;
-  ownerPrivateKey: string;
 }
 
 export interface PimlicoAccountPreview {
+  provider: 'pimlico' | 'alchemy';
   l1ChainId: number;
   l1ChainName: string;
-  resolvedBundlerUrlMasked: string;
+  proxyEndpoint: string;
   ownerAddress: Address;
   smartAccountAddress: Address;
   isDeployed: boolean;
   smartAccountEthBalance: string;
   fastMaxFeeGwei: string;
-  sponsorshipPolicyValid: boolean | null;
-  sponsorshipPolicyNote: string | null;
+  sponsorshipPolicyActive: boolean;
+  sponsorshipPolicyNote: string;
 }
 
 export interface PreparedWithdrawalActionCall {
@@ -84,55 +91,36 @@ interface Eip1193Provider {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
 }
 
+export async function fetchServerAaStatus(): Promise<ServerAaStatus> {
+  const res = await fetch('/api/aa/status');
+  if (!res.ok) {
+    throw new Error('サーバー側の Bundler 設定状態の取得に失敗しました');
+  }
+  return (await res.json()) as ServerAaStatus;
+}
+
 function getInjectedProvider(): Eip1193Provider {
   if (typeof window === 'undefined') {
-    throw new Error('ブラウザ環境でのみウォレット接続を利用できます');
+    throw new Error('ブラウザ環境でのみウォレット署名を利用できます');
   }
   const eth = (window as unknown as { ethereum?: Eip1193Provider }).ethereum;
   if (!eth || typeof eth.request !== 'function') {
     throw new Error(
-      'ブラウザウォレット (MetaMask / Rabby / Coinbase Wallet 等) が検出されませんでした。ウォレット拡張機能を有効化するか、オーナー秘密鍵モードを選択してください。'
+      'ブラウザウォレット (MetaMask / Rabby / Coinbase Wallet 等) が検出されませんでした。ウォレット拡張機能を有効化して再試行してください。'
     );
   }
   return eth;
 }
 
-export function resolvePimlicoRpcUrl(
-  rpcUrlInput: string,
-  apiKeyInput: string,
-  l1ChainId: number
+export function buildServerBundlerProxyUrl(
+  provider: 'pimlico' | 'alchemy',
+  l1ChainId: number,
+  usePaymaster: boolean
 ): string {
-  const trimmedUrl = rpcUrlInput.trim();
-  const trimmedKey = apiKeyInput.trim();
-
-  if (trimmedUrl) {
-    if (
-      trimmedKey &&
-      !trimmedUrl.includes('apikey=') &&
-      trimmedUrl.includes('pimlico.io')
-    ) {
-      const sep = trimmedUrl.includes('?') ? '&' : '?';
-      return `${trimmedUrl}${sep}apikey=${encodeURIComponent(trimmedKey)}`;
-    }
-    return trimmedUrl;
-  }
-
-  if (!trimmedKey) {
-    throw new Error(
-      'Pimlico RPC URL または Pimlico API Key のいずれかを入力してください'
-    );
-  }
-
-  return `https://api.pimlico.io/v2/${l1ChainId}/rpc?apikey=${encodeURIComponent(
-    trimmedKey
-  )}`;
-}
-
-export function maskRpcUrl(url: string): string {
-  return url.replace(/(apikey=)([^&]+)/i, (_, prefix: string, val: string) => {
-    if (val.length <= 8) return `${prefix}****`;
-    return `${prefix}${val.slice(0, 6)}...${val.slice(-4)}`;
-  });
+  const origin =
+    typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
+  const policyFlag = usePaymaster ? '1' : '0';
+  return `${origin}/api/bundler/${provider}/${l1ChainId}?policy=${policyFlag}`;
 }
 
 async function ensureInjectedChain(
@@ -162,27 +150,9 @@ async function ensureInjectedChain(
   return accounts[0] as Address;
 }
 
-async function resolveOwnerAndAddress(
-  settings: PimlicoExecutionSettings,
+async function resolveInjectedOwner(
   l1Chain: ReturnType<typeof createBaseAndL1Clients>['l1Chain']
 ) {
-  if (settings.signerSource === 'privateKey') {
-    const rawKey = settings.ownerPrivateKey.trim();
-    const normalizedKey = (
-      rawKey.startsWith('0x') ? rawKey : `0x${rawKey}`
-    ) as Hex;
-    if (!/^0x[0-9a-fA-F]{64}$/.test(normalizedKey)) {
-      throw new Error(
-        '有効な64桁16進数のオーナー秘密鍵 (0x...) を入力してください'
-      );
-    }
-    const localOwner = privateKeyToAccount(normalizedKey);
-    return {
-      owner: localOwner,
-      ownerAddress: localOwner.address,
-    };
-  }
-
   const provider = getInjectedProvider();
   const connectedAddr = await ensureInjectedChain(provider, l1Chain.id);
   const walletClient = createWalletClient({
@@ -199,12 +169,12 @@ async function resolveOwnerAndAddress(
 async function createConfiguredSmartAccount(params: {
   l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'];
   l1Chain: ReturnType<typeof createBaseAndL1Clients>['l1Chain'];
-  settings: PimlicoExecutionSettings;
+  smartAccountKind: SmartAccountKind;
 }) {
-  const { l1Client, l1Chain, settings } = params;
-  const { owner, ownerAddress } = await resolveOwnerAndAddress(settings, l1Chain);
+  const { l1Client, l1Chain, smartAccountKind } = params;
+  const { owner, ownerAddress } = await resolveInjectedOwner(l1Chain);
 
-  if (settings.smartAccountKind === 'safe') {
+  if (smartAccountKind === 'safe') {
     const safeAccount = await toSafeSmartAccount({
       client: l1Client,
       owners: [owner],
@@ -230,28 +200,41 @@ async function createConfiguredSmartAccount(params: {
 
 export async function previewPimlicoSmartAccount(
   settings: PimlicoExecutionSettings,
-  networkConfig: NetworkConfig
+  networkConfig: NetworkConfig,
+  aaStatus?: ServerAaStatus | null
 ): Promise<PimlicoAccountPreview> {
-  const { l1Client, l1Chain, portalAddress } = createBaseAndL1Clients(networkConfig);
-  const resolvedUrl = resolvePimlicoRpcUrl(
-    settings.pimlicoRpcUrl,
-    settings.pimlicoApiKey,
-    l1Chain.id
+  const provider: 'pimlico' | 'alchemy' =
+    settings.mode === 'alchemy' ? 'alchemy' : 'pimlico';
+  const { l1Client, l1Chain, portalAddress } =
+    createBaseAndL1Clients(networkConfig);
+
+  const proxyUrl = buildServerBundlerProxyUrl(
+    provider,
+    l1Chain.id,
+    settings.usePaymaster
   );
 
-  const pimlicoClient = createPimlicoClient({
-    chain: l1Chain,
-    transport: http(resolvedUrl, { timeout: 20000 }),
-    entryPoint: {
-      address: entryPoint07Address,
-      version: '0.7',
-    },
+  const { smartAccount, ownerAddress } = await createConfiguredSmartAccount({
+    l1Client,
+    l1Chain,
+    smartAccountKind: settings.smartAccountKind,
   });
 
-  const [{ smartAccount, ownerAddress }, gasPrices] = await Promise.all([
-    createConfiguredSmartAccount({ l1Client, l1Chain, settings }),
-    pimlicoClient.getUserOperationGasPrice(),
-  ]);
+  let fastMaxFeeWei = 0n;
+  if (provider === 'pimlico') {
+    const pimlicoClient = createPimlicoClient({
+      chain: l1Chain,
+      transport: http(proxyUrl, { timeout: 20000 }),
+      entryPoint: {
+        address: entryPoint07Address,
+        version: '0.7',
+      },
+    });
+    const gasPrices = await pimlicoClient.getUserOperationGasPrice();
+    fastMaxFeeWei = gasPrices.fast.maxFeePerGas;
+  } else {
+    fastMaxFeeWei = await l1Client.getGasPrice();
+  }
 
   const [code, balanceWei] = await Promise.all([
     l1Client.getCode({ address: smartAccount.address }).catch(() => undefined),
@@ -259,39 +242,42 @@ export async function previewPimlicoSmartAccount(
   ]);
 
   const isDeployed = Boolean(code && code !== '0x');
-  let sponsorshipPolicyValid: boolean | null = null;
-  let sponsorshipPolicyNote: string | null = null;
+  const policyConfigured =
+    provider === 'pimlico'
+      ? Boolean(aaStatus?.pimlicoPolicyConfigured)
+      : Boolean(aaStatus?.alchemyPolicyConfigured);
 
-  const policyId = settings.sponsorshipPolicyId.trim();
-  if (settings.usePaymaster && policyId) {
-    try {
-      // Optional policy pre-check with dummy UserOp structure if supported
-      sponsorshipPolicyNote = `Sponsorship Policy (${policyId}) を Paymaster コンテキストに設定済み · 対象コントラクト ${portalAddress.slice(
-        0,
-        10
-      )}...`;
-      sponsorshipPolicyValid = true;
-    } catch {
-      sponsorshipPolicyValid = null;
-    }
+  let sponsorshipPolicyNote = '';
+  if (settings.usePaymaster && policyConfigured) {
+    sponsorshipPolicyNote =
+      provider === 'pimlico'
+        ? `Pimlico Sponsorship Policy (サーバー設定済) を自動適用 · 対象 ${portalAddress.slice(
+            0,
+            10
+          )}...`
+        : `Alchemy Gas Manager Policy (サーバー設定済) を自動適用 · 対象 ${portalAddress.slice(
+            0,
+            10
+          )}...`;
   } else if (settings.usePaymaster) {
     sponsorshipPolicyNote =
-      'Paymaster 有効（Policy ID 未指定：デフォルトの Verifying Paymaster 設定を使用します）';
+      'Paymaster 有効（サーバー側 Verifying Paymaster 設定を使用）';
   } else {
     sponsorshipPolicyNote =
       'Paymaster 無効（Smart Account 自身の ETH 残高から L1 ガス代を支払います）';
   }
 
   return {
+    provider,
     l1ChainId: l1Chain.id,
     l1ChainName: l1Chain.name,
-    resolvedBundlerUrlMasked: maskRpcUrl(resolvedUrl),
+    proxyEndpoint: `/api/bundler/${provider}/${l1Chain.id}`,
     ownerAddress,
     smartAccountAddress: smartAccount.address,
     isDeployed,
     smartAccountEthBalance: Number(formatEther(balanceWei)).toFixed(6),
-    fastMaxFeeGwei: Number(formatGwei(gasPrices.fast.maxFeePerGas)).toFixed(3),
-    sponsorshipPolicyValid,
+    fastMaxFeeGwei: Number(formatGwei(fastMaxFeeWei)).toFixed(3),
+    sponsorshipPolicyActive: settings.usePaymaster && policyConfigured,
     sponsorshipPolicyNote,
   };
 }
@@ -336,7 +322,7 @@ export async function prepareWithdrawalActionCall(
   }
   if (alreadyFinalized) {
     throw new Error(
-      'この出金トランザクションは既に Ethereum L1 でファイナライズ（出金完了）されています'
+      'この出金トランザクションは既に Ethereum L1 で資金受け取り完了（finalized）しています'
     );
   }
 
@@ -411,7 +397,7 @@ export async function prepareWithdrawalActionCall(
   const numSubs = Number(numSubsBig);
   if (numSubs === 0) {
     throw new Error(
-      'まだ L1 に出金証明 (Prove) が提出されていません。先に Prove を実行してください。'
+      'まだ L1 に出金証明 (proveWithdrawalTransaction) が提出されていません。先に Prove を実行してください。'
     );
   }
 
@@ -448,7 +434,6 @@ export async function prepareWithdrawalActionCall(
       break;
     } catch (err) {
       lastCheckError = err instanceof Error ? err.message : String(err);
-      // Check if game expectedResolution (1d TEE+ZK or 5d single proof) + proofMaturityDelay have both passed and only resolve() is pending
       try {
         const proven = await l1Client.readContract({
           address: portalAddress,
@@ -489,7 +474,6 @@ export async function prepareWithdrawalActionCall(
     );
   }
 
-  // Use finalizeWithdrawalTransactionExternalProof so ANY caller (Pimlico SmartAccount or any EOA) can finalize!
   const callData = encodeFunctionData({
     abi: OPTIMISM_PORTAL_READ_ABI,
     functionName: 'finalizeWithdrawalTransactionExternalProof',
@@ -536,7 +520,7 @@ export async function executeWithdrawalOnL1(params: {
   onStep?.(
     action === 'prove'
       ? 'L2 Merkle証明および L1 DisputeGame ルート証明を構築中...'
-      : 'L1 OptimismPortal2 の checkWithdrawal 条件とファイナライズ引数を検証中...'
+      : 'L1 OptimismPortal2 の checkWithdrawal 条件と資金受け取り引数を検証中...'
   );
 
   const prepared = await prepareWithdrawalActionCall(
@@ -615,59 +599,25 @@ export async function executeWithdrawalOnL1(params: {
     };
   }
 
-  // Mode: Pimlico ERC-4337 Bundler + Paymaster
-  const resolvedUrl = resolvePimlicoRpcUrl(
-    settings.pimlicoRpcUrl,
-    settings.pimlicoApiKey,
-    l1Chain.id
+  // ERC-4337 Account Abstraction via Server-Side Bundler & Paymaster Proxy (Pimlico or Alchemy)
+  const providerName = settings.mode === 'alchemy' ? 'alchemy' : 'pimlico';
+  const proxyUrl = buildServerBundlerProxyUrl(
+    providerName,
+    l1Chain.id,
+    settings.usePaymaster
   );
 
-  onStep?.('Pimlico Bundler 接続および ERC-4337 Smart Account を初期化中...');
-  const pimlicoClient = createPimlicoClient({
-    chain: l1Chain,
-    transport: http(resolvedUrl, { timeout: 30000 }),
-    entryPoint: {
-      address: entryPoint07Address,
-      version: '0.7',
-    },
-  });
+  onStep?.(
+    `${
+      providerName === 'pimlico' ? 'Pimlico' : 'Alchemy'
+    } Bundler プロキシ接続および ERC-4337 Smart Account を初期化中...`
+  );
 
   const { smartAccount, ownerAddress } = await createConfiguredSmartAccount({
     l1Client,
     l1Chain,
-    settings,
+    smartAccountKind: settings.smartAccountKind,
   });
-
-  const policyId = settings.sponsorshipPolicyId.trim();
-
-  const smartAccountClient = createSmartAccountClient({
-    account: smartAccount,
-    chain: l1Chain,
-    client: l1Client,
-    bundlerTransport: http(resolvedUrl, { timeout: 30000 }),
-    paymaster: settings.usePaymaster ? pimlicoClient : undefined,
-    paymasterContext:
-      settings.usePaymaster && policyId
-        ? { sponsorshipPolicyId: policyId }
-        : undefined,
-    userOperation: {
-      estimateFeesPerGas: async () => {
-        const prices = await pimlicoClient.getUserOperationGasPrice();
-        return prices.fast;
-      },
-    },
-  });
-
-  onStep?.(
-    settings.usePaymaster
-      ? `Pimlico Paymaster${
-          policyId ? ` (Policy: ${policyId})` : ''
-        } でスポンサー見積取得＆UserOperation署名を要求中...`
-      : `Smart Account (${smartAccount.address.slice(
-          0,
-          10
-        )}...) で UserOperation 署名を要求中...`
-  );
 
   const calls = prepared.resolveGameAddress
     ? [
@@ -693,18 +643,103 @@ export async function executeWithdrawalOnL1(params: {
         },
       ];
 
-  const userOpHash = await smartAccountClient.sendUserOperation({
-    calls,
+  if (providerName === 'pimlico') {
+    const pimlicoClient = createPimlicoClient({
+      chain: l1Chain,
+      transport: http(proxyUrl, { timeout: 30000 }),
+      entryPoint: {
+        address: entryPoint07Address,
+        version: '0.7',
+      },
+    });
+
+    const smartAccountClient = createSmartAccountClient({
+      account: smartAccount,
+      chain: l1Chain,
+      client: l1Client,
+      bundlerTransport: http(proxyUrl, { timeout: 30000 }),
+      paymaster: settings.usePaymaster ? pimlicoClient : undefined,
+      userOperation: {
+        estimateFeesPerGas: async () => {
+          const prices = await pimlicoClient.getUserOperationGasPrice();
+          return prices.fast;
+        },
+      },
+    });
+
+    onStep?.(
+      settings.usePaymaster
+        ? 'Pimlico Paymaster スポンサー見積取得 ＆ ウォレット署名を要求中...'
+        : `Smart Account (${smartAccount.address.slice(
+            0,
+            10
+          )}...) で UserOperation 署名を要求中...`
+    );
+
+    const userOpHash = await smartAccountClient.sendUserOperation({ calls });
+
+    onStep?.(
+      `Pimlico Bundler へ UserOperation 送信完了 (${userOpHash.slice(
+        0,
+        12
+      )}...) · L1 バンドル確定を待機中...`
+    );
+
+    const uoReceipt = await pimlicoClient.waitForUserOperationReceipt({
+      hash: userOpHash,
+      timeout: 180_000,
+    });
+
+    if (!uoReceipt.success) {
+      throw new Error(
+        `UserOperation はバンドルされましたが内部実行で失敗しました (L1 Tx: ${uoReceipt.receipt.transactionHash})`
+      );
+    }
+
+    return {
+      action,
+      mode: 'pimlico',
+      l1ChainId: l1Chain.id,
+      l1TxHash: uoReceipt.receipt.transactionHash,
+      userOpHash,
+      smartAccountAddress: smartAccount.address,
+      callerAddress: ownerAddress,
+      blockNumber: Number(uoReceipt.receipt.blockNumber),
+    };
+  }
+
+  // Alchemy ERC-4337 Bundler + ERC-7677 Gas Manager Paymaster Proxy
+  const alchemyPaymaster = createPaymasterClient({
+    transport: http(proxyUrl, { timeout: 30000 }),
+  });
+
+  const alchemySmartAccountClient = createSmartAccountClient({
+    account: smartAccount,
+    chain: l1Chain,
+    client: l1Client,
+    bundlerTransport: http(proxyUrl, { timeout: 30000 }),
+    paymaster: settings.usePaymaster ? alchemyPaymaster : undefined,
   });
 
   onStep?.(
-    `Pimlico Bundler へ UserOperation 送信完了 (${userOpHash.slice(
-      0,
-      12
-    )}...) · L1 バンドル取込を待機中...`
+    settings.usePaymaster
+      ? 'Alchemy Gas Manager スポンサー見積取得 ＆ ウォレット署名を要求中...'
+      : `Smart Account (${smartAccount.address.slice(
+          0,
+          10
+        )}...) で UserOperation 署名を要求中...`
   );
 
-  const uoReceipt = await pimlicoClient.waitForUserOperationReceipt({
+  const userOpHash = await alchemySmartAccountClient.sendUserOperation({ calls });
+
+  onStep?.(
+    `Alchemy Bundler へ UserOperation 送信完了 (${userOpHash.slice(
+      0,
+      12
+    )}...) · L1 バンドル確定を待機中...`
+  );
+
+  const uoReceipt = await alchemySmartAccountClient.waitForUserOperationReceipt({
     hash: userOpHash,
     timeout: 180_000,
   });
@@ -717,7 +752,7 @@ export async function executeWithdrawalOnL1(params: {
 
   return {
     action,
-    mode: 'pimlico',
+    mode: 'alchemy',
     l1ChainId: l1Chain.id,
     l1TxHash: uoReceipt.receipt.transactionHash,
     userOpHash,

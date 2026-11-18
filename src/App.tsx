@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { onIdTokenChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { Check, LogIn, LogOut, RefreshCw } from 'lucide-react';
 import {
   ChainHeadSnapshot,
   ExecutionStatus,
@@ -19,22 +21,57 @@ import {
 import { fetchRecentWithdrawalSamples } from './lib/withdrawalAnalyzer';
 import {
   clearFinalizedCache,
+  getAllCachedFinalizedResults,
   getFinalizedCacheCount,
+  isImmutableFinalizedResult,
   lookupFinalizedCache,
   saveFinalizedResultsToCache,
 } from './lib/finalizedCache';
+import { auth, googleAuthProvider } from './lib/firebase';
 import { TopBar, ActiveTab } from './components/TopBar';
 import { ChainHeadStrip } from './components/ChainHeadStrip';
 import { BatchInputPanel } from './components/BatchInputPanel';
 import { VerificationTable } from './components/VerificationTable';
 import { WithdrawalVerificationSection } from './components/WithdrawalVerificationSection';
+import { AiAuditAssistantSection } from './components/AiAuditAssistantSection';
 import { TxInspectorDrawer } from './components/TxInspectorDrawer';
 import { FinalityGuideSection } from './components/FinalityGuideSection';
 import { HistorySection } from './components/HistorySection';
 import { WithdrawalSimulatorSection } from './components/WithdrawalSimulatorSection';
 
 const HISTORY_STORAGE_KEY = 'base-finality-history-v1';
+const WORKSPACE_STORAGE_KEY = 'base-finality-workspace-v1';
 const AUTO_POLL_SECONDS = 15;
+
+const VALID_TABS = new Set<ActiveTab>([
+  'verify',
+  'withdrawal-verify',
+  'withdrawals',
+  'ai-audit',
+  'guide',
+  'history',
+]);
+
+const VALID_NETWORKS = new Set<NetworkId>([
+  'base-mainnet',
+  'base-sepolia',
+  'custom',
+]);
+
+interface PersistedWorkspaceState {
+  activeTab: ActiveTab;
+  networkId: NetworkId;
+  customRpcUrl: string;
+  rawInput: string;
+  withdrawalRawInput: string;
+  results: VerifiedTransactionResult[];
+  verifiedSnapshot: ChainHeadSnapshot | null;
+  withdrawalVerifyResults: VerifiedTransactionResult[];
+  withdrawalSnapshot: ChainHeadSnapshot | null;
+  simulatorInitialHash: string | null;
+  lastRunCacheStats: { reusedFromLocal: number; fetchedFromRpc: number } | null;
+  updatedAt: number;
+}
 
 function fallbackReliability(r: Partial<VerifiedTransactionResult>): ReliabilityInfo {
   if (r.reliability && r.reliability.tier && r.reliability.label) {
@@ -56,28 +93,119 @@ function fallbackReliability(r: Partial<VerifiedTransactionResult>): Reliability
   };
 }
 
+function normalizeSnapshot(snap: unknown): ChainHeadSnapshot | null {
+  if (!snap || typeof snap !== 'object') return null;
+  const s = snap as ChainHeadSnapshot;
+  return {
+    ...s,
+    l1Head: s.l1Head ?? {
+      latestNumber: null,
+      finalizedNumber: null,
+      rpcEndpointUsed: null,
+    },
+    isServerProxy:
+      typeof s.isServerProxy === 'boolean'
+        ? s.isServerProxy
+        : Boolean(s.rpcEndpointUsed?.startsWith('/api/rpc/')),
+  };
+}
+
+function normalizeResults(raw: unknown): VerifiedTransactionResult[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((r): r is VerifiedTransactionResult => Boolean(r && typeof r === 'object'))
+    .map((r) => ({
+      ...r,
+      reliability: fallbackReliability(r),
+    }));
+}
+
+function compactResults(rows: VerifiedTransactionResult[]): VerifiedTransactionResult[] {
+  return rows.slice(0, 500).map((r) => ({
+    ...r,
+    rawTx: null,
+    rawReceipt: null,
+  }));
+}
+
+function loadWorkspaceFromStorage(): PersistedWorkspaceState | null {
+  try {
+    const raw = localStorage.getItem(WORKSPACE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const tab = VALID_TABS.has(parsed.activeTab) ? parsed.activeTab : 'verify';
+    const net = VALID_NETWORKS.has(parsed.networkId) ? parsed.networkId : 'base-mainnet';
+    return {
+      activeTab: tab,
+      networkId: net,
+      customRpcUrl: typeof parsed.customRpcUrl === 'string' ? parsed.customRpcUrl : '',
+      rawInput: typeof parsed.rawInput === 'string' ? parsed.rawInput : '',
+      withdrawalRawInput:
+        typeof parsed.withdrawalRawInput === 'string' ? parsed.withdrawalRawInput : '',
+      results: normalizeResults(parsed.results),
+      verifiedSnapshot: normalizeSnapshot(parsed.verifiedSnapshot),
+      withdrawalVerifyResults: normalizeResults(parsed.withdrawalVerifyResults),
+      withdrawalSnapshot: normalizeSnapshot(parsed.withdrawalSnapshot),
+      simulatorInitialHash:
+        typeof parsed.simulatorInitialHash === 'string'
+          ? parsed.simulatorInitialHash
+          : null,
+      lastRunCacheStats:
+        parsed.lastRunCacheStats && typeof parsed.lastRunCacheStats === 'object'
+          ? parsed.lastRunCacheStats
+          : null,
+      updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveWorkspaceToStorage(ws: PersistedWorkspaceState): void {
+  try {
+    localStorage.setItem(
+      WORKSPACE_STORAGE_KEY,
+      JSON.stringify({
+        ...ws,
+        results: compactResults(ws.results),
+        withdrawalVerifyResults: compactResults(ws.withdrawalVerifyResults),
+      })
+    );
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
 function loadHistoryFromStorage(): VerificationRunSummary[] {
   try {
     const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.map((run: VerificationRunSummary) => ({
-      ...run,
-      snapshot: {
-        ...run.snapshot,
-        isServerProxy:
-          typeof run.snapshot?.isServerProxy === 'boolean'
-            ? run.snapshot.isServerProxy
-            : Boolean(run.snapshot?.rpcEndpointUsed?.startsWith('/api/rpc/')),
-      },
-      results: Array.isArray(run.results)
-        ? run.results.map((r) => ({
-            ...r,
-            reliability: fallbackReliability(r),
-          }))
-        : [],
-    }));
+    return parsed
+      .filter((run): run is VerificationRunSummary => Boolean(run && typeof run === 'object'))
+      .map((run: VerificationRunSummary) => ({
+        ...run,
+        snapshot:
+          normalizeSnapshot(run.snapshot) ?? {
+            networkId: run.networkId ?? 'base-mainnet',
+            networkName: run.networkName ?? 'Base Mainnet',
+            chainId: 8453,
+            rpcEndpointUsed: '',
+            isServerProxy: false,
+            fetchedAt: run.createdAt ?? Date.now(),
+            latest: null,
+            safe: null,
+            finalized: null,
+            l1Head: {
+              latestNumber: null,
+              finalizedNumber: null,
+              rpcEndpointUsed: null,
+            },
+          },
+        results: normalizeResults(run.results),
+      }));
   } catch {
     return [];
   }
@@ -87,11 +215,7 @@ function saveHistoryToStorage(runs: VerificationRunSummary[]): void {
   try {
     const compact = runs.slice(0, 20).map((run) => ({
       ...run,
-      results: run.results.map((r) => ({
-        ...r,
-        rawTx: null,
-        rawReceipt: null,
-      })),
+      results: compactResults(run.results),
     }));
     localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(compact));
   } catch {
@@ -100,12 +224,20 @@ function saveHistoryToStorage(runs: VerificationRunSummary[]): void {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('verify');
-  const [networkId, setNetworkId] = useState<NetworkId>('base-mainnet');
-  const [customRpcUrl, setCustomRpcUrl] = useState('');
+  const initialWorkspace = useMemo(() => loadWorkspaceFromStorage(), []);
+
+  const [activeTab, setActiveTab] = useState<ActiveTab>(
+    () => initialWorkspace?.activeTab ?? 'verify'
+  );
+  const [networkId, setNetworkId] = useState<NetworkId>(
+    () => initialWorkspace?.networkId ?? 'base-mainnet'
+  );
+  const [customRpcUrl, setCustomRpcUrl] = useState(
+    () => initialWorkspace?.customRpcUrl ?? ''
+  );
 
   // Main Batch Tab State
-  const [rawInput, setRawInput] = useState('');
+  const [rawInput, setRawInput] = useState(() => initialWorkspace?.rawInput ?? '');
   const [headSnapshot, setHeadSnapshot] = useState<ChainHeadSnapshot | null>(null);
   const [isLoadingHead, setIsLoadingHead] = useState(false);
   const [headError, setHeadError] = useState<string | null>(null);
@@ -114,7 +246,9 @@ export default function App() {
   const [isRetryingErrors, setIsRetryingErrors] = useState(false);
   const [isLoadingSamples, setIsLoadingSamples] = useState(false);
   const [isLoadingWithdrawalSamples, setIsLoadingWithdrawalSamples] = useState(false);
-  const [simulatorInitialHash, setSimulatorInitialHash] = useState<string | null>(null);
+  const [simulatorInitialHash, setSimulatorInitialHash] = useState<string | null>(
+    () => initialWorkspace?.simulatorInitialHash ?? null
+  );
   const [verifyError, setVerifyError] = useState<string | null>(null);
   const [progress, setProgress] = useState<{
     completed: number;
@@ -124,19 +258,27 @@ export default function App() {
   const [lastRunCacheStats, setLastRunCacheStats] = useState<{
     reusedFromLocal: number;
     fetchedFromRpc: number;
-  } | null>(null);
+  } | null>(() => initialWorkspace?.lastRunCacheStats ?? null);
   const [cacheVersion, setCacheVersion] = useState(0);
 
-  const [results, setResults] = useState<VerifiedTransactionResult[]>([]);
-  const [verifiedSnapshot, setVerifiedSnapshot] = useState<ChainHeadSnapshot | null>(null);
+  const [results, setResults] = useState<VerifiedTransactionResult[]>(
+    () => initialWorkspace?.results ?? []
+  );
+  const [verifiedSnapshot, setVerifiedSnapshot] = useState<ChainHeadSnapshot | null>(
+    () => initialWorkspace?.verifiedSnapshot ?? null
+  );
   const [selectedResult, setSelectedResult] = useState<VerifiedTransactionResult | null>(null);
 
   // Dedicated Withdrawal Verification Tab State
-  const [withdrawalRawInput, setWithdrawalRawInput] = useState('');
+  const [withdrawalRawInput, setWithdrawalRawInput] = useState(
+    () => initialWorkspace?.withdrawalRawInput ?? ''
+  );
   const [withdrawalVerifyResults, setWithdrawalVerifyResults] = useState<
     VerifiedTransactionResult[]
-  >([]);
-  const [withdrawalSnapshot, setWithdrawalSnapshot] = useState<ChainHeadSnapshot | null>(null);
+  >(() => initialWorkspace?.withdrawalVerifyResults ?? []);
+  const [withdrawalSnapshot, setWithdrawalSnapshot] = useState<ChainHeadSnapshot | null>(
+    () => initialWorkspace?.withdrawalSnapshot ?? null
+  );
   const [isVerifyingWithdrawals, setIsVerifyingWithdrawals] = useState(false);
   const [isRetryingWithdrawalErrors, setIsRetryingWithdrawalErrors] = useState(false);
   const [isLoadingWithdrawalTabSamples, setIsLoadingWithdrawalTabSamples] = useState(false);
@@ -154,6 +296,17 @@ export default function App() {
     loadHistoryFromStorage()
   );
 
+  // Firebase Auth & Sync state (ID token stored strictly in memory)
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [cloudWorkspaceReady, setCloudWorkspaceReady] = useState(false);
+  const [isSyncingCloud, setIsSyncingCloud] = useState(false);
+  const [lastSavedAt, setLastSavedAt] = useState<number>(
+    () => initialWorkspace?.updatedAt || Date.now()
+  );
+  const skipNextLocalTimestampBumpRef = useRef(false);
+
   const activeNetworkConfig: NetworkConfig = useMemo(() => {
     if (networkId === 'custom') {
       return {
@@ -168,6 +321,314 @@ export default function App() {
     }
     return NETWORK_PRESETS[networkId];
   }, [networkId, customRpcUrl]);
+
+  useEffect(() => {
+    const unsubscribe = onIdTokenChanged(auth, async (user) => {
+      if (!user) {
+        setAuthToken(null);
+        setUserEmail(null);
+        setCloudWorkspaceReady(false);
+        return;
+      }
+      try {
+        const token = await user.getIdToken();
+        setAuthToken(token);
+        setUserEmail(user.email ?? user.uid);
+        fetch('/api/user/me', {
+          headers: { Authorization: `Bearer ${token}` },
+        }).catch(() => {});
+      } catch {
+        setAuthToken(null);
+        setUserEmail(null);
+        setCloudWorkspaceReady(false);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Automatically save workspace state to localStorage on every change
+  const isInitialMountRef = useRef(true);
+  useEffect(() => {
+    if (isInitialMountRef.current) {
+      isInitialMountRef.current = false;
+      return;
+    }
+    const now = skipNextLocalTimestampBumpRef.current ? lastSavedAt : Date.now();
+    skipNextLocalTimestampBumpRef.current = false;
+    setLastSavedAt(now);
+    saveWorkspaceToStorage({
+      activeTab,
+      networkId,
+      customRpcUrl,
+      rawInput,
+      withdrawalRawInput,
+      results,
+      verifiedSnapshot,
+      withdrawalVerifyResults,
+      withdrawalSnapshot,
+      simulatorInitialHash,
+      lastRunCacheStats,
+      updatedAt: now,
+    });
+  }, [
+    activeTab,
+    networkId,
+    customRpcUrl,
+    rawInput,
+    withdrawalRawInput,
+    results,
+    verifiedSnapshot,
+    withdrawalVerifyResults,
+    withdrawalSnapshot,
+    simulatorInitialHash,
+    lastRunCacheStats,
+  ]);
+
+  const syncFinalizedToCloud = useCallback(
+    (rows: VerifiedTransactionResult[]) => {
+      if (!authToken) return;
+      const immutableRows = rows.filter(isImmutableFinalizedResult);
+      if (immutableRows.length === 0) return;
+
+      fetch('/api/tx-cache', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          items: immutableRows.map((r) => ({
+            networkId: activeNetworkConfig.id,
+            chainId: activeNetworkConfig.chainId,
+            txHash: r.hash,
+            finality: r.finality,
+            executionStatus: r.executionStatus,
+            blockNumber: r.blockNumber,
+            l1OriginBlock: r.l1OriginBlock,
+            isWithdrawal: r.withdrawal !== null,
+            portalFinalized: r.withdrawal?.portalFinalized ?? null,
+            reliabilityTier: r.reliability?.tier ?? 'verified_onchain',
+            payloadJson: { ...r, rawTx: null, rawReceipt: null },
+          })),
+        }),
+      }).catch(() => {});
+    },
+    [authToken, activeNetworkConfig.id, activeNetworkConfig.chainId]
+  );
+
+  // Bidirectional sync on Google sign-in: workspace, finalized cache, and verification history
+  useEffect(() => {
+    if (!authToken) return;
+    let cancelled = false;
+    setIsSyncingCloud(true);
+
+    const localFinalized = getAllCachedFinalizedResults(
+      activeNetworkConfig.id,
+      activeNetworkConfig.chainId
+    );
+    if (localFinalized.length > 0) {
+      syncFinalizedToCloud(localFinalized);
+    }
+
+    const syncAll = async () => {
+      try {
+        // 1. Sync Finalized cache
+        const txRes = await fetch(
+          `/api/tx-cache?networkId=${encodeURIComponent(
+            activeNetworkConfig.id
+          )}&chainId=${activeNetworkConfig.chainId}`,
+          { headers: { Authorization: `Bearer ${authToken}` } }
+        );
+        if (!cancelled && txRes.ok) {
+          const txData = await txRes.json();
+          if (Array.isArray(txData?.items) && txData.items.length > 0) {
+            const count = saveFinalizedResultsToCache(
+              activeNetworkConfig.id,
+              activeNetworkConfig.chainId,
+              txData.items as VerifiedTransactionResult[]
+            );
+            if (count > 0) setCacheVersion((v) => v + 1);
+          }
+        }
+
+        // 2. Sync verification history (both directions)
+        const runsRes = await fetch('/api/runs', {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (!cancelled && runsRes.ok) {
+          const runsData = await runsRes.json();
+          const cloudRuns = Array.isArray(runsData?.runs)
+            ? (runsData.runs as VerificationRunSummary[])
+            : [];
+          const cloudIds = new Set(cloudRuns.map((r) => r.id));
+
+          const currentLocalRuns = loadHistoryFromStorage();
+          for (const localRun of currentLocalRuns.slice(0, 10)) {
+            if (localRun.id && !cloudIds.has(localRun.id)) {
+              fetch('/api/runs', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${authToken}`,
+                },
+                body: JSON.stringify({
+                  ...localRun,
+                  results: compactResults(localRun.results),
+                }),
+              }).catch(() => {});
+            }
+          }
+
+          setHistory((prev) => {
+            const map = new Map(prev.map((r) => [r.id, r]));
+            for (const run of cloudRuns) {
+              if (run?.id && !map.has(run.id)) {
+                map.set(run.id, {
+                  ...run,
+                  snapshot:
+                    normalizeSnapshot(run.snapshot) ?? prev[0]?.snapshot ?? ({} as ChainHeadSnapshot),
+                  results: normalizeResults(run.results),
+                });
+              }
+            }
+            const merged = Array.from(map.values())
+              .sort((a, b) => b.createdAt - a.createdAt)
+              .slice(0, 20);
+            saveHistoryToStorage(merged);
+            return merged;
+          });
+        }
+
+        // 3. Hydrate or push active workspace state
+        const wsRes = await fetch('/api/workspace', {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (!cancelled && wsRes.ok) {
+          const wsData = await wsRes.json();
+          const cloudWs = wsData?.workspace;
+          const currentLocalWs = loadWorkspaceFromStorage();
+          const localHasWork = Boolean(
+            currentLocalWs &&
+              (currentLocalWs.rawInput.trim() ||
+                currentLocalWs.results.length > 0 ||
+                currentLocalWs.withdrawalRawInput.trim() ||
+                currentLocalWs.withdrawalVerifyResults.length > 0)
+          );
+          const cloudUpdatedAt = Number(
+            cloudWs?.stateJson?.clientUpdatedAt ?? cloudWs?.updatedAt ?? 0
+          );
+          const localUpdatedAt = currentLocalWs?.updatedAt ?? 0;
+
+          if (cloudWs && (!localHasWork || cloudUpdatedAt > localUpdatedAt)) {
+            const sj = (cloudWs.stateJson ?? {}) as Record<string, unknown>;
+            skipNextLocalTimestampBumpRef.current = true;
+            setLastSavedAt(cloudUpdatedAt || Date.now());
+            if (VALID_TABS.has(cloudWs.activeTab)) {
+              setActiveTab(cloudWs.activeTab);
+            }
+            if (VALID_NETWORKS.has(cloudWs.networkId)) {
+              setNetworkId(cloudWs.networkId);
+            }
+            setCustomRpcUrl(String(cloudWs.customRpcUrl || ''));
+            setRawInput(String(cloudWs.rawInput || ''));
+            setWithdrawalRawInput(String(cloudWs.withdrawalRawInput || ''));
+            setResults(normalizeResults(sj.results));
+            setVerifiedSnapshot(normalizeSnapshot(sj.verifiedSnapshot));
+            setWithdrawalVerifyResults(normalizeResults(sj.withdrawalVerifyResults));
+            setWithdrawalSnapshot(normalizeSnapshot(sj.withdrawalSnapshot));
+            if (typeof sj.simulatorInitialHash === 'string') {
+              setSimulatorInitialHash(sj.simulatorInitialHash);
+            }
+          }
+        }
+      } catch {
+        // Non-fatal cloud sync error; local storage remains intact
+      } finally {
+        if (!cancelled) {
+          setCloudWorkspaceReady(true);
+          setIsSyncingCloud(false);
+        }
+      }
+    };
+
+    syncAll();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken, activeNetworkConfig.id, activeNetworkConfig.chainId, syncFinalizedToCloud]);
+
+  // Continuously push workspace changes to cloud once initial hydration completes
+  useEffect(() => {
+    if (!authToken || !cloudWorkspaceReady) return;
+    const timer = setTimeout(() => {
+      setIsSyncingCloud(true);
+      fetch('/api/workspace', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          activeTab,
+          networkId,
+          customRpcUrl,
+          rawInput,
+          withdrawalRawInput,
+          stateJson: {
+            results: compactResults(results),
+            verifiedSnapshot,
+            withdrawalVerifyResults: compactResults(withdrawalVerifyResults),
+            withdrawalSnapshot,
+            simulatorInitialHash,
+            lastRunCacheStats,
+            clientUpdatedAt: Date.now(),
+          },
+        }),
+      })
+        .then((res) => {
+          if (res.ok) setLastSavedAt(Date.now());
+        })
+        .catch(() => {})
+        .finally(() => setIsSyncingCloud(false));
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [
+    authToken,
+    cloudWorkspaceReady,
+    activeTab,
+    networkId,
+    customRpcUrl,
+    rawInput,
+    withdrawalRawInput,
+    results,
+    verifiedSnapshot,
+    withdrawalVerifyResults,
+    withdrawalSnapshot,
+    simulatorInitialHash,
+    lastRunCacheStats,
+  ]);
+
+  const handleSignIn = async () => {
+    setAuthBusy(true);
+    try {
+      await signInWithPopup(auth, googleAuthProvider);
+    } catch {
+      // Popup closed or blocked
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    setAuthBusy(true);
+    try {
+      await signOut(auth);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
   const verifiedWithdrawals = useMemo(() => {
     const combined = new Map<string, VerifiedTransactionResult>();
@@ -354,7 +815,7 @@ export default function App() {
           mergedRows.push({ ...inv, index: rowIdx++ });
         }
 
-        // Persist any newly Finalized immutable results to local cache
+        // Persist any newly Finalized immutable results to local cache (+ cloud if signed in)
         const savedCount = saveFinalizedResultsToCache(
           activeNetworkConfig.id,
           activeNetworkConfig.chainId,
@@ -362,6 +823,7 @@ export default function App() {
         );
         if (savedCount > 0) {
           setCacheVersion((v) => v + 1);
+          syncFinalizedToCloud(mergedRows);
         }
 
         setLastRunCacheStats({
@@ -408,6 +870,20 @@ export default function App() {
             counts,
           };
 
+          if (authToken) {
+            fetch('/api/runs', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${authToken}`,
+              },
+              body: JSON.stringify({
+                ...entry,
+                results: entry.results.map((r) => ({ ...r, rawTx: null, rawReceipt: null })),
+              }),
+            }).catch(() => {});
+          }
+
           setHistory((prev) => {
             const next = [entry, ...prev].slice(0, 20);
             saveHistoryToStorage(next);
@@ -422,7 +898,14 @@ export default function App() {
         setIsVerifying(false);
       }
     },
-    [parsedBatch, activeNetworkConfig, headSnapshot, mergeWithdrawalsIntoTab]
+    [
+      parsedBatch,
+      activeNetworkConfig,
+      headSnapshot,
+      mergeWithdrawalsIntoTab,
+      syncFinalizedToCloud,
+      authToken,
+    ]
   );
 
   // Auto-poll effect (automatically reuses local Finalized cache and polls only remaining items!)
@@ -537,6 +1020,7 @@ export default function App() {
         );
         if (savedCount > 0) {
           setCacheVersion((v) => v + 1);
+          syncFinalizedToCloud(retriedRows);
         }
 
         const retriedMap = new Map(retriedRows.map((r) => [r.hash.toLowerCase(), r]));
@@ -562,7 +1046,7 @@ export default function App() {
         setIsRetryingErrors(false);
       }
     },
-    [activeNetworkConfig, mergeWithdrawalsIntoTab, results.length]
+    [activeNetworkConfig, mergeWithdrawalsIntoTab, results.length, syncFinalizedToCloud]
   );
 
   // Dedicated Withdrawal Tab Handlers
@@ -598,12 +1082,15 @@ export default function App() {
           }
         );
 
-        saveFinalizedResultsToCache(
+        const savedCount = saveFinalizedResultsToCache(
           activeNetworkConfig.id,
           activeNetworkConfig.chainId,
           verifiedRows
         );
-        setCacheVersion((v) => v + 1);
+        if (savedCount > 0) {
+          setCacheVersion((v) => v + 1);
+          syncFinalizedToCloud(verifiedRows);
+        }
 
         setHeadSnapshot(snapshot);
         setWithdrawalSnapshot(snapshot);
@@ -616,7 +1103,7 @@ export default function App() {
         setIsVerifyingWithdrawals(false);
       }
     },
-    [parsedWithdrawalBatch, activeNetworkConfig]
+    [parsedWithdrawalBatch, activeNetworkConfig, syncFinalizedToCloud]
   );
 
   const handleFetchWithdrawalTabSamples = async () => {
@@ -661,6 +1148,15 @@ export default function App() {
           retryParsed,
           activeNetworkConfig
         );
+        const savedCount = saveFinalizedResultsToCache(
+          activeNetworkConfig.id,
+          activeNetworkConfig.chainId,
+          retriedRows
+        );
+        if (savedCount > 0) {
+          setCacheVersion((v) => v + 1);
+          syncFinalizedToCloud(retriedRows);
+        }
         const retriedMap = new Map(retriedRows.map((r) => [r.hash.toLowerCase(), r]));
         setHeadSnapshot(snapshot);
         setWithdrawalSnapshot(snapshot);
@@ -679,7 +1175,7 @@ export default function App() {
         setIsRetryingWithdrawalErrors(false);
       }
     },
-    [activeNetworkConfig]
+    [activeNetworkConfig, syncFinalizedToCloud]
   );
 
   const handleClear = () => {
@@ -718,51 +1214,124 @@ export default function App() {
             </p>
           </div>
 
-          <div
-            role="tablist"
-            aria-label="検証モード切り替え"
-            className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-lg shrink-0"
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === 'verify'}
-              onClick={() => setActiveTab('verify')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-                activeTab === 'verify'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <div
+              role="tablist"
+              aria-label="検証モード切り替え"
+              className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-lg"
             >
-              一括検証
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === 'withdrawal-verify'}
-              onClick={() => setActiveTab('withdrawal-verify')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-                activeTab === 'withdrawal-verify'
-                  ? 'bg-white text-[#0052FF] shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              出金検証
-              {verifiedWithdrawals.length > 0 ? ` (${verifiedWithdrawals.length})` : ''}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === 'withdrawals'}
-              onClick={() => setActiveTab('withdrawals')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-                activeTab === 'withdrawals'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              出金シミュレーター
-            </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'verify'}
+                onClick={() => setActiveTab('verify')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                  activeTab === 'verify'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                一括検証
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'withdrawal-verify'}
+                onClick={() => setActiveTab('withdrawal-verify')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                  activeTab === 'withdrawal-verify'
+                    ? 'bg-white text-[#0052FF] shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                出金検証
+                {verifiedWithdrawals.length > 0 ? ` (${verifiedWithdrawals.length})` : ''}
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'withdrawals'}
+                onClick={() => setActiveTab('withdrawals')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                  activeTab === 'withdrawals'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                出金確定・シミュレーター
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'ai-audit'}
+                onClick={() => setActiveTab('ai-audit')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                  activeTab === 'ai-audit'
+                    ? 'bg-white text-[#0052FF] shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                AI監査チャット
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'guide'}
+                onClick={() => setActiveTab('guide')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                  activeTab === 'guide'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                検証ロジック
+              </button>
+            </div>
+
+            <span className="inline-flex items-center gap-1.5 text-xs text-slate-500 px-1">
+              {isSyncingCloud ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#0052FF]" />
+                  <span>クラウド保存中...</span>
+                </>
+              ) : (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>
+                    {userEmail ? 'クラウド同期済' : 'ローカル自動保存済'}
+                    {' · '}
+                    {new Date(lastSavedAt).toLocaleTimeString('ja-JP', {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })}
+                  </span>
+                </>
+              )}
+            </span>
+
+            {userEmail ? (
+              <button
+                type="button"
+                onClick={handleSignOut}
+                disabled={authBusy}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                title={`${userEmail} でクラウド同期中（クリックでサインアウト）`}
+              >
+                <span className="max-w-[140px] truncate">{userEmail}</span>
+                <LogOut className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleSignIn}
+                disabled={authBusy}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                title="Googleサインインで入力状態・検証結果・確定キャッシュ・履歴をクラウド保存します"
+              >
+                <LogIn className="w-3.5 h-3.5 text-[#0052FF]" />
+                <span>Google同期ログイン</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -805,6 +1374,17 @@ export default function App() {
                 clearFinalizedCache(activeNetworkConfig.id, activeNetworkConfig.chainId);
                 setCacheVersion((v) => v + 1);
                 setLastRunCacheStats(null);
+                if (authToken) {
+                  fetch(
+                    `/api/tx-cache?networkId=${encodeURIComponent(
+                      activeNetworkConfig.id
+                    )}&chainId=${activeNetworkConfig.chainId}`,
+                    {
+                      method: 'DELETE',
+                      headers: { Authorization: `Bearer ${authToken}` },
+                    }
+                  ).catch(() => {});
+                }
               }}
               onForceRefreshAll={() => runBatchVerification(undefined, true, true)}
             />
@@ -880,6 +1460,16 @@ export default function App() {
           />
         )}
 
+        {activeTab === 'ai-audit' && (
+          <AiAuditAssistantSection
+            snapshot={verifiedSnapshot ?? withdrawalSnapshot ?? headSnapshot}
+            results={results}
+            withdrawalResults={withdrawalVerifyResults}
+            authToken={authToken}
+            userEmail={userEmail}
+          />
+        )}
+
         {activeTab === 'guide' && <FinalityGuideSection />}
 
         {activeTab === 'history' && (
@@ -903,6 +1493,12 @@ export default function App() {
             onClearHistory={() => {
               setHistory([]);
               saveHistoryToStorage([]);
+              if (authToken) {
+                fetch('/api/runs', {
+                  method: 'DELETE',
+                  headers: { Authorization: `Bearer ${authToken}` },
+                }).catch(() => {});
+              }
             }}
           />
         )}
@@ -911,7 +1507,7 @@ export default function App() {
       <footer className="border-t border-slate-200 bg-white mt-12">
         <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-8 py-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-xs text-slate-500">
           <span>
-            Base Finality · オンチェーンJSON-RPC直接検証コンソール（外部DB・トラッキング不使用）
+            Base Finality · オンチェーンJSON-RPC直接検証コンソール
           </span>
           <span className="font-mono">
             OP Stack Finality: Latest → Safe (L1 Batch) → Finalized (L1 Casper FFG)

@@ -53,7 +53,9 @@ function writeStore(store: FinalizedCacheStore): void {
  */
 export function isImmutableFinalizedResult(r: VerifiedTransactionResult): boolean {
   if (r.finality !== FinalityStage.FINALIZED) return false;
-  if (r.withdrawal && !r.withdrawal.portalFinalized) return false;
+  if (r.withdrawal && (!r.withdrawal.portalFinalized || !r.withdrawal.validation)) {
+    return false;
+  }
   return true;
 }
 
@@ -137,6 +139,21 @@ export function lookupFinalizedCache(
   }
 
   return { cachedMap, missingHashes };
+}
+
+export function getAllCachedFinalizedResults(
+  networkId: NetworkId,
+  chainId: number
+): VerifiedTransactionResult[] {
+  const store = readStore();
+  const prefix = `${networkId === 'custom' ? `custom-${chainId}` : networkId}:`;
+  const list: VerifiedTransactionResult[] = [];
+  for (const [k, entry] of Object.entries(store)) {
+    if (k.startsWith(prefix) && entry?.result && isImmutableFinalizedResult(entry.result)) {
+      list.push(entry.result);
+    }
+  }
+  return list;
 }
 
 export function getFinalizedCacheCount(networkId: NetworkId, chainId: number): number {

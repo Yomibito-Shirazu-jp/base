@@ -4,6 +4,7 @@ export type ActiveTab =
   | 'verify'
   | 'withdrawal-verify'
   | 'withdrawals'
+  | 'ai-audit'
   | 'guide'
   | 'history';
 
@@ -70,18 +71,18 @@ export function TopBar({
                 : 'border-transparent text-slate-600 hover:text-slate-900 hover:border-slate-300'
             }`}
           >
-            出金シミュレーター
+            出金確定・シミュレーター
           </button>
           <button
             type="button"
-            onClick={() => onSelectTab('guide')}
+            onClick={() => onSelectTab('ai-audit')}
             className={`py-1 text-xs sm:text-sm font-medium transition-colors whitespace-nowrap shrink-0 border-b-2 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0052FF] ${
-              activeTab === 'guide'
+              activeTab === 'ai-audit'
                 ? 'border-[#0052FF] text-slate-900'
                 : 'border-transparent text-slate-600 hover:text-slate-900 hover:border-slate-300'
             }`}
           >
-            検証ロジック
+            AI監査チャット
           </button>
           <button
             type="button"

@@ -21,10 +21,12 @@ import {
   fetchLiveWithdrawalConditions,
   fetchRecentWithdrawalSamples,
   formatSecondsJapanese,
+  getProveLifecycleBadgeText,
   getWithdrawalStatusLabel,
   simulateWithdrawalOnL1,
 } from '../lib/withdrawalAnalyzer';
 import { formatUnixTimestamp, shortenHex } from '../lib/exportUtils';
+import { PimlicoExecutionPanel } from './PimlicoExecutionPanel';
 
 interface WithdrawalSimulatorSectionProps {
   networkConfig: NetworkConfig;
@@ -58,7 +60,8 @@ export function WithdrawalSimulatorSection({
   const [simTokenSymbol, setSimTokenSymbol] = useState('USDC');
   const [simAmount, setSimAmount] = useState('1.0');
   const [simL1GweiOverride, setSimL1GweiOverride] = useState('');
-  const [simProposalMinutes, setSimProposalMinutes] = useState('60');
+  const [simProposalMinutes, setSimProposalMinutes] = useState('30');
+  const [simUsePimlicoSponsor, setSimUsePimlicoSponsor] = useState(false);
 
   const loadConditions = useCallback(async () => {
     if (networkConfig.rpcUrls.length === 0) return;
@@ -68,6 +71,11 @@ export function WithdrawalSimulatorSection({
       setConditions(cond);
       if (!simL1GweiOverride) {
         setSimL1GweiOverride(cond.l1GasPriceGwei);
+      }
+      if (cond.proposalIntervalSeconds > 0) {
+        setSimProposalMinutes(
+          String(Math.max(5, Math.round(cond.proposalIntervalSeconds / 60)))
+        );
       }
     } catch {
       // Non-fatal
@@ -90,12 +98,12 @@ export function WithdrawalSimulatorSection({
 
       setIsAnalyzingTx(true);
       setTxError(null);
-      setWithdrawalInfo(null);
-      setSimResult(null);
 
       try {
         const info = await analyzeWithdrawalFromTxHash(cleaned as Hex, networkConfig);
         if (!info) {
+          setWithdrawalInfo(null);
+          setSimResult(null);
           setTxError(
             'このトランザクションには L2ToL1MessagePasser の出金イベントが見つかりませんでした'
           );
@@ -157,34 +165,49 @@ export function WithdrawalSimulatorSection({
     if (withdrawalInfo.estimatedClaimableAtMs === null) {
       return withdrawalInfo.totalSecondsRemaining;
     }
-    const diffSec = Math.max(
+    return Math.max(
       0,
       Math.ceil((withdrawalInfo.estimatedClaimableAtMs - nowMs) / 1000)
     );
-    return diffSec;
   }, [withdrawalInfo, nowMs]);
 
-  // Interactive what-if simulator math using live on-chain parameters
+  // Interactive what-if simulator math using BOTH DisputeGame resolution (~5 days) and Proof Maturity (1 day)
   const whatIfSimulation = useMemo(() => {
     const parsedAmount = Number(simAmount);
     const amountValid = Number.isFinite(parsedAmount) && parsedAmount >= 0;
     const gwei = Number(simL1GweiOverride || conditions?.l1GasPriceGwei || '1');
     const validGwei = Number.isFinite(gwei) && gwei >= 0 ? gwei : 1;
-    const proposalMin = Math.max(0, Number(simProposalMinutes) || 60);
+    const proposalMin = Math.max(0, Number(simProposalMinutes) || 30);
 
     const proveGas = conditions?.estimatedProveGas ?? 290000;
     const finalizeGas = conditions?.estimatedFinalizeGas ?? 230000;
 
     // 1 Gwei = 1e-9 ETH
-    const proveCostEth = proveGas * validGwei * 1e-9;
-    const finalizeCostEth = finalizeGas * validGwei * 1e-9;
+    const rawProveCostEth = proveGas * validGwei * 1e-9;
+    const rawFinalizeCostEth = finalizeGas * validGwei * 1e-9;
+    const proveCostEth = simUsePimlicoSponsor ? 0 : rawProveCostEth;
+    const finalizeCostEth = simUsePimlicoSponsor ? 0 : rawFinalizeCostEth;
     const totalL1GasEth = proveCostEth + finalizeCostEth;
+    const rawTotalL1GasEth = rawProveCostEth + rawFinalizeCostEth;
 
     const maturitySec = conditions?.proofMaturityDelaySeconds ?? 86400;
-    const gameDelaySec = conditions?.disputeGameFinalityDelaySeconds ?? 0;
-    const totalWaitSec = Math.round(proposalMin * 60 + maturitySec + gameDelaySec);
-    const claimableAtSec = Math.floor(nowMs / 1000) + totalWaitSec;
-    const proveReadyAtSec = Math.floor(nowMs / 1000) + Math.round(proposalMin * 60);
+    const gameResolutionSec =
+      conditions?.disputeGameResolutionSeconds ?? 432000;
+    const gameFinalityDelaySec =
+      conditions?.disputeGameFinalityDelaySeconds ?? 0;
+
+    // Crucial OP Stack v6 rule: post-Prove wait is max(DisputeGame resolution + finalityDelay, proofMaturityDelay)
+    const postProveWaitSec = Math.max(
+      gameResolutionSec + gameFinalityDelaySec,
+      maturitySec
+    );
+    const proposalSec = Math.round(proposalMin * 60);
+    const totalWaitSec = proposalSec + postProveWaitSec;
+
+    const nowSec = Math.floor(nowMs / 1000);
+    const proveReadyAtSec = nowSec + proposalSec;
+    const proveMaturityDoneAtSec = proveReadyAtSec + maturitySec;
+    const claimableAtSec = nowSec + totalWaitSec;
 
     const netEth =
       simAssetType === 'ETH' && amountValid
@@ -197,10 +220,14 @@ export function WithdrawalSimulatorSection({
       proveCostEth,
       finalizeCostEth,
       totalL1GasEth,
+      rawTotalL1GasEth,
       maturitySec,
-      gameDelaySec,
+      gameResolutionSec,
+      gameFinalityDelaySec,
+      postProveWaitSec,
       totalWaitSec,
       proveReadyAtSec,
+      proveMaturityDoneAtSec,
       claimableAtSec,
       netEth,
     };
@@ -209,21 +236,22 @@ export function WithdrawalSimulatorSection({
     simL1GweiOverride,
     simProposalMinutes,
     simAssetType,
+    simUsePimlicoSponsor,
     conditions,
     nowMs,
   ]);
 
   return (
     <div className="space-y-6">
-      {/* Section 1: Real On-Chain Withdrawal Inspector & L1 Dry-Run Simulation */}
+      {/* Section 1: Real On-Chain Withdrawal Inspector, Prove Status & Direct L1 Execution */}
       <section className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
           <div>
             <h2 className="text-base font-bold text-slate-900">
-              実トランザクション L2→L1 出金残り時間・金額・L1ドライラン検証
+              実トランザクション Prove状態チェック・L1ドライラン・そのまま出金確定 (Pimlico対応)
             </h2>
             <p className="mt-1 text-xs text-slate-600">
-              Base の出金トランザクションハッシュを指定すると、金額・アセット・OptimismPortal2 の成熟期間残り時間と L1 実行可否をリアルタイムにシミュレーションします。
+              Base の出金トランザクションハッシュを入力すると、L2 MessagePasser・Prove状態・DisputeGame解決残り時間を実測し、そのまま Pimlico (RPC / API Key / Policy ID) またはウォレットで Prove / Finalize を実行できます。
             </p>
           </div>
           <button
@@ -237,10 +265,10 @@ export function WithdrawalSimulatorSection({
           </button>
         </div>
 
-        {/* Detected withdrawal shortcuts from batch table */}
+        {/* Detected withdrawal shortcuts from batch / withdrawal tables */}
         {verifiedWithdrawals.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="text-slate-500 font-medium">検証済みバッチ内の出金Tx:</span>
+            <span className="text-slate-500 font-medium">検証済みの出金Txを選択:</span>
             {verifiedWithdrawals.map((item) => (
               <button
                 key={item.hash}
@@ -249,7 +277,11 @@ export function WithdrawalSimulatorSection({
                   setTxHashInput(item.hash);
                   runTxAnalysisAndSimulation(item.hash);
                 }}
-                className="px-2.5 py-1 font-mono text-xs bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-md transition-colors cursor-pointer"
+                className={`px-2.5 py-1 font-mono text-xs rounded-md transition-colors cursor-pointer ${
+                  txHashInput.toLowerCase() === item.hash.toLowerCase()
+                    ? 'bg-[#0052FF] text-white'
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-800'
+                }`}
               >
                 {shortenHex(item.hash, 8, 6)}
                 {item.withdrawal
@@ -277,12 +309,12 @@ export function WithdrawalSimulatorSection({
             {isAnalyzingTx ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin" />
-                <span>L1/L2 シミュレーション中...</span>
+                <span>Prove状態・L1検証中...</span>
               </>
             ) : (
               <>
                 <Play className="w-4 h-4 fill-current" />
-                <span>残り時間・L1シミュレーション実行</span>
+                <span>Prove状態チェック・出金画面を開く</span>
               </>
             )}
           </button>
@@ -314,7 +346,7 @@ export function WithdrawalSimulatorSection({
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                   <Clock className="w-3.5 h-3.5" />
-                  <span>出金可能までの残り時間</span>
+                  <span>出金確定 (Finalize) まで残り</span>
                 </div>
                 <div
                   className={`mt-1.5 text-xl font-bold font-mono tabular-nums ${
@@ -328,26 +360,30 @@ export function WithdrawalSimulatorSection({
                     ? `予定: ${formatUnixTimestamp(
                         Math.floor(withdrawalInfo.estimatedClaimableAtMs / 1000)
                       )}`
-                    : 'Claim 準備状態'}
+                    : withdrawalInfo.portalFinalized
+                    ? 'L1 着金完了済'
+                    : '今すぐ Claim 実行可能'}
                 </div>
               </div>
 
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                   <ShieldCheck className="w-3.5 h-3.5" />
-                  <span>現在の L1 出金ステージ</span>
+                  <span>現在のステージ / Prove状態</span>
                 </div>
-                <div className="mt-1.5 text-base font-bold text-slate-900">
+                <div className="mt-1.5 text-sm font-bold text-slate-900">
                   {getWithdrawalStatusLabel(withdrawalInfo.status)}
                 </div>
-                <div className="mt-1 text-xs text-slate-500 font-mono tabular-nums">
-                  L1成熟遅延: {formatSecondsJapanese(withdrawalInfo.proofMaturityDelaySeconds)}
+                <div className="mt-1 text-xs text-[#0052FF] font-medium truncate">
+                  {withdrawalInfo.validation
+                    ? getProveLifecycleBadgeText(withdrawalInfo.validation.proveState)
+                    : '—'}
                 </div>
               </div>
 
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500">
-                  推定L1実行コスト / 実質受取
+                  推定L1ガス代 / 実質受取額
                 </div>
                 <div className="mt-1.5 text-base font-bold font-mono tabular-nums text-slate-900">
                   {simResult ? `${simResult.totalL1ClaimCostEth} ETH` : '計算中...'}
@@ -355,7 +391,7 @@ export function WithdrawalSimulatorSection({
                 <div className="mt-1 text-xs text-slate-600 font-mono tabular-nums truncate">
                   {simResult?.netAmountFormatted
                     ? `実質: ${simResult.netAmountFormatted}`
-                    : ''}
+                    : 'Pimlico Policy指定時はガス0 ETH可'}
                 </div>
               </div>
             </div>
@@ -377,7 +413,7 @@ export function WithdrawalSimulatorSection({
                       <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
                     )}
                     <span>
-                      Ethereum L1 OptimismPortal2 ({simResult.l1DryRunAction}) ドライラン結果
+                      Ethereum L1 OptimismPortal2 ({simResult.l1DryRunAction}) ＆ 待機後着金ドライラン
                     </span>
                   </div>
                   <span className="text-xs font-mono tabular-nums text-slate-600">
@@ -389,41 +425,78 @@ export function WithdrawalSimulatorSection({
                 <p className="text-xs leading-relaxed">{simResult.l1DryRunMessage}</p>
               </div>
             )}
+
+            {/* Direct L1 Prove & Finalize Execution Console (Pimlico ERC-4337 + Wallet) */}
+            <PimlicoExecutionPanel
+              txHash={txHashInput.trim()}
+              withdrawalInfo={withdrawalInfo}
+              networkConfig={networkConfig}
+              nowMs={nowMs}
+              onExecutionCompleted={() => runTxAnalysisAndSimulation(txHashInput)}
+            />
           </div>
         )}
       </section>
 
-      {/* Section 2: Interactive Withdrawal Schedule & Net Amount Simulator */}
+      {/* Section 2: Accurate Dual-Window New Withdrawal Timeline & Net Amount Simulator */}
       <section className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
-          <div>
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 pb-4 border-b border-slate-100">
+          <div className="space-y-1.5">
             <h2 className="text-base font-bold text-slate-900">
-              新規出金 タイムライン＆実質受取額シミュレーター
+              新規出金 タイムライン＆実質受取額シミュレーター（2段階ロック実測対応）
             </h2>
-            <p className="mt-1 text-xs text-slate-600">
-              Ethereum L1 の最新 <span className="font-mono">OptimismPortal2</span>{' '}
-              パラメーター（成熟遅延{' '}
-              <span className="font-mono tabular-nums">
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Ethereum L1 の最新{' '}
+              <span className="font-mono text-slate-800">
+                OptimismPortal2{conditions?.portalVersion ? ` v${conditions.portalVersion}` : ''}
+              </span>{' '}
+              では、出金確定までに{' '}
+              <strong className="text-slate-900">
+                ① DisputeGame解決期間（GameType {conditions?.respectedGameType ?? 621} 実測:{' '}
                 {conditions
-                  ? `${conditions.proofMaturityDelaySeconds.toLocaleString()}秒 (${formatSecondsJapanese(
-                      conditions.proofMaturityDelaySeconds
-                    )})`
+                  ? `${conditions.disputeGameResolutionSeconds.toLocaleString()}秒 = ${formatSecondsJapanese(
+                      conditions.disputeGameResolutionSeconds
+                    )}`
                   : '取得中...'}
-              </span>
-              ）と現在の L1 ガス価格を使って事前シミュレーションします。
+                ）
+              </strong>{' '}
+              と{' '}
+              <strong className="text-slate-900">
+                ② Prove提出後の成熟遅延（
+                {conditions
+                  ? `${conditions.proofMaturityDelaySeconds.toLocaleString()}秒 = ${formatSecondsJapanese(
+                      conditions.proofMaturityDelaySeconds
+                    )}`
+                  : '取得中...'}
+                ）
+              </strong>{' '}
+              の<strong>両方の経過（長い方＝実質 約5日間）</strong>が必要です。
             </p>
             {conditions && (
-              <div className="mt-1.5 text-[11px] font-medium text-slate-500">
-                信頼性・参照ソース:{' '}
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-medium text-slate-500">
+                <span>信頼性・参照ソース:</span>
                 <span
                   className={
                     conditions.usedFallbackDelay ? 'text-amber-700' : 'text-emerald-700'
                   }
                 >
                   {conditions.usedFallbackDelay
-                    ? '一部フォールバック値使用 (L1契約読取フォールバックあり)'
-                    : 'L1 OptimismPortal2 実測値 · Live GasPrice 取得済み'}
+                    ? '一部フォールバック値使用'
+                    : 'L1 OptimismPortal2 & DisputeGameFactory 解決履歴実測値'}
                 </span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono tabular-nums">
+                  直近Game提案間隔: 約{Math.max(1, Math.round(conditions.proposalIntervalSeconds / 60))}分
+                </span>
+                {conditions.rawMeasuredResolutionSeconds !== null && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono tabular-nums">
+                      Game解決実測(resolvedAt-createdAt):{' '}
+                      {conditions.rawMeasuredResolutionSeconds.toLocaleString()}秒
+                    </span>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -434,12 +507,12 @@ export function WithdrawalSimulatorSection({
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isLoadingConditions ? 'animate-spin' : ''}`} />
-            <span>最新ガス・遅延設定を再取得</span>
+            <span>最新オンチェーン設定を再取得</span>
           </button>
         </div>
 
         {/* Inputs */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 items-end">
           <div>
             <label className="block text-xs font-medium text-slate-700 mb-1.5">
               出金アセット種別
@@ -523,7 +596,7 @@ export function WithdrawalSimulatorSection({
               htmlFor="sim-proposal-min"
               className="block text-xs font-medium text-slate-700 mb-1.5"
             >
-              L1 Output/Game 提案待機 (分)
+              L1 DisputeGame 提案待機 (分)
             </label>
             <input
               id="sim-proposal-min"
@@ -535,31 +608,63 @@ export function WithdrawalSimulatorSection({
               className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0052FF]"
             />
           </div>
+
+          <div className="pb-2">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={simUsePimlicoSponsor}
+                onChange={(e) => setSimUsePimlicoSponsor(e.target.checked)}
+                className="rounded border-slate-300 text-[#0052FF] focus:ring-[#0052FF]"
+              />
+              <span>Pimlico Paymaster スポンサー適用</span>
+            </label>
+          </div>
         </div>
 
         {/* Simulated Timeline & Net Outcome */}
         <div className="border border-slate-200 rounded-xl divide-y divide-slate-100">
-          <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+          <div className="p-4 grid grid-cols-1 md:grid-cols-4 gap-4 items-start">
             <div>
-              <div className="text-xs text-slate-500">推定出金完了 (Claim可能) 所要時間</div>
+              <div className="text-xs text-slate-500">
+                新規出金の総所要時間 (L2実行→L1受取)
+              </div>
               <div className="mt-1 text-xl font-bold font-mono tabular-nums text-slate-900">
                 {formatSecondsJapanese(whatIfSimulation.totalWaitSec)}
               </div>
               <div className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
-                完了予定: {formatUnixTimestamp(whatIfSimulation.claimableAtSec)}
+                受取可能予定: {formatUnixTimestamp(whatIfSimulation.claimableAtSec)}
               </div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">
-                L1 手数料合計 (Prove + Finalize 推定)
+                待機内訳 (長い方の完了が必須)
+              </div>
+              <div className="mt-1 text-xs font-mono tabular-nums text-slate-900 space-y-0.5">
+                <div>
+                  ・Game解決: <strong>{formatSecondsJapanese(whatIfSimulation.gameResolutionSec)}</strong>
+                </div>
+                <div>
+                  ・Prove後成熟: <strong>{formatSecondsJapanese(whatIfSimulation.maturitySec)}</strong>
+                </div>
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-500">
+                ※5日経過後に遅れてProveした場合はProve後1日で確定可
+              </div>
+            </div>
+
+            <div>
+              <div className="text-xs text-slate-500">
+                自己負担 L1 手数料 (Prove + Finalize)
               </div>
               <div className="mt-1 text-xl font-bold font-mono tabular-nums text-slate-900">
                 {whatIfSimulation.totalL1GasEth.toFixed(6)} ETH
               </div>
               <div className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
-                Prove {whatIfSimulation.proveCostEth.toFixed(6)} + Finalize{' '}
-                {whatIfSimulation.finalizeCostEth.toFixed(6)} ETH
+                {simUsePimlicoSponsor
+                  ? `Paymaster負担 (実費相当 ${whatIfSimulation.rawTotalL1GasEth.toFixed(6)} ETH)`
+                  : `Prove ${whatIfSimulation.proveCostEth.toFixed(6)} + Finalize ${whatIfSimulation.finalizeCostEth.toFixed(6)} ETH`}
               </div>
             </div>
 
@@ -573,32 +678,41 @@ export function WithdrawalSimulatorSection({
                     }`}
               </div>
               <div className="mt-0.5 text-xs text-slate-500">
-                {simAssetType === 'ETH'
-                  ? '出金額から L1 Prove/Finalize 手数料を控除'
+                {simUsePimlicoSponsor
+                  ? 'Pimlico Sponsorship Policy により L1 ガス代控除なし'
+                  : simAssetType === 'ETH'
+                  ? '出金額から L1 Prove/Finalize ガス代を控除'
                   : `別途 L1 ガス代 ${whatIfSimulation.totalL1GasEth.toFixed(6)} ETH が必要`}
               </div>
             </div>
           </div>
 
-          <div className="p-4 bg-slate-50/70 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3 text-xs">
+          <div className="p-4 bg-slate-50/70 flex flex-col xl:flex-row items-start xl:items-center justify-between gap-3 text-xs">
             <div className="flex flex-wrap items-center gap-2 text-slate-700">
-              <span className="font-semibold text-slate-900">1. L2 実行</span>
-              <span className="font-mono text-slate-500">
+              <span className="font-semibold text-slate-900">1. Base L2 出金開始</span>
+              <span className="font-mono tabular-nums text-slate-500">
                 ({formatUnixTimestamp(Math.floor(nowMs / 1000))})
               </span>
               <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-              <span className="font-semibold text-slate-900">2. L1 Prove 可能</span>
-              <span className="font-mono text-slate-500">
+              <span className="font-semibold text-slate-900">2. L1 Prove 実行可能</span>
+              <span className="font-mono tabular-nums text-slate-500">
                 ({formatUnixTimestamp(whatIfSimulation.proveReadyAtSec)})
               </span>
               <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-              <span className="font-semibold text-emerald-700">3. L1 Finalize (Claim) 可能</span>
-              <span className="font-mono text-emerald-700">
+              <span className="text-slate-600">
+                [Prove1日成熟: {formatUnixTimestamp(whatIfSimulation.proveMaturityDoneAtSec)}]
+              </span>
+              <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
+              <span className="font-semibold text-emerald-700">
+                3. Game解決＆L1 Finalize可能
+              </span>
+              <span className="font-mono tabular-nums text-emerald-700">
                 ({formatUnixTimestamp(whatIfSimulation.claimableAtSec)})
               </span>
             </div>
             <span className="text-slate-500 font-mono tabular-nums shrink-0">
-              L2 Base Gas: {conditions?.l2GasPriceGwei ?? '—'} Gwei
+              L2 Base Gas: {conditions?.l2GasPriceGwei ?? '—'} Gwei · L1 Gas:{' '}
+              {conditions?.l1GasPriceGwei ?? '—'} Gwei
             </span>
           </div>
         </div>

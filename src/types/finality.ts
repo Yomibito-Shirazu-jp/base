@@ -96,6 +96,111 @@ export interface ReliabilityInfo {
   caveat: string | null;
 }
 
+export interface ValidationCheckItem {
+  id: string;
+  label: string;
+  passed: boolean;
+  status: 'pass' | 'warn' | 'fail';
+  detail: string;
+}
+
+export interface MessagePasserStatus {
+  contractAddress: string;
+  sentMessageRecorded: boolean;
+  messageVersion: number;
+  storageKey: string;
+  storageSlotValue: string | null;
+  storageRoot: string | null;
+  merkleProofNodes: number;
+  merkleProofVerified: boolean;
+}
+
+export type ProveLifecycleState =
+  | 'unproven-waiting-game'
+  | 'unproven-ready'
+  | 'proven-waiting'
+  | 'proven-ready'
+  | 'finalized'
+  | 'invalid-need-reprove';
+
+export type DisputeWindowMode = 'dual-1d' | 'single-5d' | 'standard';
+
+export interface TeeZkProofInspection {
+  checkedAtMs: number;
+  supportedMultiProof: boolean;
+  isReferenceLatestGame: boolean;
+  disputeGameAddress: string | null;
+  disputeGameIndex: number | null;
+  gameType: number | null;
+  gameVersion: string | null;
+  gameStatus: number | null;
+  l2SequenceNumber: number | null;
+  hasTeeProof: boolean;
+  hasZkProof: boolean;
+  teeProver: string | null;
+  zkProver: string | null;
+  teeVerifier: string | null;
+  zkVerifier: string | null;
+  proofCount: number;
+  proofThreshold: number;
+  fastFinalizationDelaySeconds: number;
+  slowFinalizationDelaySeconds: number;
+  activeWindowSeconds: number;
+  windowMode: DisputeWindowMode;
+  createdAt: number | null;
+  expectedResolution: number | null;
+  resolvedAt: number | null;
+  remainingToResolveSeconds: number | null;
+  canCallResolveNow: boolean;
+  summary: string;
+}
+
+export interface StepSimulationDetail {
+  step: 'prove' | 'finalize';
+  methodName: 'proveWithdrawalTransaction' | 'finalizeWithdrawalTransaction';
+  passed: boolean;
+  alreadyCompletedOnChain: boolean;
+  executableNow: boolean;
+  estimatedGas: string;
+  estimatedFeeEth: string;
+  summary: string;
+}
+
+export interface WithdrawalValidationReport {
+  canWithdrawAfterWait: boolean;
+  verdictLabel: string;
+  verdictSummary: string;
+  portalAddress: string;
+  portalVersion: string | null;
+  respectedGameType: number | null;
+  portalPaused: boolean;
+  alreadyFinalizedOnL1: boolean;
+  proveState: ProveLifecycleState;
+  proveStateLabel: string;
+  numProofSubmitters: number;
+  proofSubmitter: string | null;
+  proofSubmittersList: string[];
+  disputeGameIndex: number | null;
+  disputeGameAddress: string | null;
+  disputeGameStatus: number | null;
+  disputeGameCreatedAt: number | null;
+  disputeGameResolvedAt: number | null;
+  disputeGameBlacklisted: boolean | null;
+  provenTimestamp: number | null;
+  maturityRemainingSeconds: number | null;
+  gameResolutionRemainingSeconds: number | null;
+  checkWithdrawalPassed: boolean | null;
+  checkWithdrawalError: string | null;
+  l1LiquiditySufficient: boolean | null;
+  l1LiquidityDetail: string;
+  outerPortalRelaySimulated: boolean;
+  innerBridgeRelaySimulated: boolean | null;
+  postWaitSimError: string | null;
+  messagePasser: MessagePasserStatus;
+  teeZk?: TeeZkProofInspection | null;
+  checks: ValidationCheckItem[];
+}
+
 export interface WithdrawalInfo {
   withdrawalHash: string;
   nonce: string;
@@ -115,13 +220,19 @@ export interface WithdrawalInfo {
   status: WithdrawalStatus;
   portalFinalized: boolean;
   usedFallbackDelay: boolean;
+  portalVersion?: string | null;
+  respectedGameType?: number | null;
   proofMaturityDelaySeconds: number;
+  disputeGameResolutionSeconds: number;
+  fastFinalizationDelaySeconds?: number;
+  slowFinalizationDelaySeconds?: number;
   disputeGameFinalityDelaySeconds: number;
   secondsToProve: number | null;
   secondsToFinalize: number | null;
   totalSecondsRemaining: number | null;
   estimatedClaimableAtMs: number | null;
   analyzedAtMs: number;
+  validation?: WithdrawalValidationReport;
 }
 
 export interface WithdrawalSimulationResult {
@@ -141,9 +252,14 @@ export interface WithdrawalSimulationResult {
   l1DryRunAction: 'finalizeWithdrawalTransaction' | 'proveWithdrawalTransaction' | 'already-finalized';
   l1DryRunSuccess: boolean;
   l1DryRunMessage: string;
+  proveSim: StepSimulationDetail;
+  finalizeSim: StepSimulationDetail;
   proofMaturityDelaySeconds: number;
+  disputeGameResolutionSeconds: number;
   estimatedClaimableAtMs: number | null;
   totalSecondsRemaining: number | null;
+  teeZk?: TeeZkProofInspection | null;
+  validation?: WithdrawalValidationReport;
 }
 
 export interface VerifiedTransactionResult {

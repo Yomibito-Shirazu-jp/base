@@ -511,8 +511,11 @@ export function computeReliability(
       };
     }
 
-    basis.push('L1 OptimismPortal2.finalizedWithdrawals');
-    basis.push('L1 OptimismPortal2 遅延設定・状態照会');
+    basis.push('L2ToL1MessagePasser.sentMessages & MPTストレージ証明');
+    basis.push('L1 OptimismPortal2.finalizedWithdrawals / paused / DisputeGame');
+    if (row.withdrawal.validation?.outerPortalRelaySimulated) {
+      basis.push('L1 stateOverride 待機後ブリッジ着金ドライラン');
+    }
 
     if (snapshot.l1Head.finalizedNumber === null) {
       return {
@@ -529,7 +532,7 @@ export function computeReliability(
         label: '一部推定を含む (フォールバック値使用)',
         basis,
         caveat:
-          'L1の一部タイムスタンプ/遅延呼び出しでフォールバック値を使用したため、残り時間は概算です（finalizedWithdrawals は実測済み）。',
+          'L1の一部タイムスタンプ/遅延呼び出しでフォールバック値を使用したため、残り時間は概算です（MessagePasser・L1着金可否は実測済み）。',
       };
     }
 
@@ -547,10 +550,10 @@ export function computeReliability(
 
     return {
       tier: 'estimated_pending',
-      label: '一部推定・待機指標を含む',
+      label: 'L1着金検証済・時刻のみ推定',
       basis,
       caveat:
-        'L1 finalizedWithdrawals と契約設定は実測済みですが、出金可能予定日時は DisputeGame 提出・成熟進行に基づく推定です。',
+        'MessagePasser証明・L1支払原資・待機経過後の着金ドライランは実測確認済みです（完了予定日時のみ DisputeGame 進行に依存）。',
     };
   }
 

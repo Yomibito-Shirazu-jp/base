@@ -336,11 +336,13 @@ export function TxInspectorDrawer({
                 ? Math.max(0, Math.ceil((w.estimatedClaimableAtMs - nowMs) / 1000))
                 : w.totalSecondsRemaining;
 
+            const val = w.validation ?? simResult?.validation;
+
             return (
               <div>
                 <div className="flex items-center justify-between gap-2 mb-3">
                   <h4 className="text-xs font-semibold text-slate-500">
-                    L2 → L1 出金可能残り時間・金額・L1シミュレーション
+                    L2 → L1 実出金可否・MessagePasser・出金バリデーション検証
                   </h4>
                   {onOpenInSimulator && (
                     <button
@@ -362,7 +364,7 @@ export function TxInspectorDrawer({
                       </div>
                     </div>
                     <div>
-                      <div className="text-[11px] text-slate-500">出金ステータス</div>
+                      <div className="text-[11px] text-slate-500">現在の L1 進行段階</div>
                       <div className="mt-0.5 text-xs font-semibold text-slate-900">
                         {getWithdrawalStatusLabel(w.status)}
                       </div>
@@ -379,7 +381,129 @@ export function TxInspectorDrawer({
                     </div>
                   </div>
 
+                  {/* Post-Wait Actual Executability Verdict */}
+                  {val && (
+                    <div
+                      className={`rounded-xl border p-3.5 space-y-1.5 ${
+                        val.canWithdrawAfterWait
+                          ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                          : 'bg-red-50/70 border-red-200 text-red-950'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 text-xs font-bold">
+                        {val.canWithdrawAfterWait ? (
+                          <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />
+                        ) : (
+                          <ShieldAlert className="w-4 h-4 text-red-700 shrink-0" />
+                        )}
+                        <span>待機時間経過後の実出金検証: {val.verdictLabel}</span>
+                      </div>
+                      <p className="text-xs leading-relaxed opacity-90">
+                        {val.verdictSummary}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* L2ToL1MessagePasser Status Block */}
+                  {val?.messagePasser && (
+                    <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-800">
+                          L2ToL1MessagePasser ステータス (0x4200...0016)
+                        </span>
+                        <span
+                          className={`text-xs font-mono font-semibold ${
+                            val.messagePasser.sentMessageRecorded &&
+                            val.messagePasser.merkleProofVerified
+                              ? 'text-emerald-700'
+                              : 'text-red-700'
+                          }`}
+                        >
+                          {val.messagePasser.sentMessageRecorded
+                            ? 'sentMessages = true · MPT証明確認済'
+                            : 'sentMessages = false'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-[11px] font-mono text-slate-600">
+                        <div className="truncate" title={val.messagePasser.storageKey}>
+                          SlotKey: {val.messagePasser.storageKey.slice(0, 14)}...
+                          {val.messagePasser.storageKey.slice(-8)}
+                        </div>
+                        <div>
+                          Slot値:{' '}
+                          {val.messagePasser.storageSlotValue
+                            ? `${BigInt(val.messagePasser.storageSlotValue).toString()} (Version ${val.messagePasser.messageVersion})`
+                            : `Version ${val.messagePasser.messageVersion}`}
+                        </div>
+                        <div
+                          className="truncate"
+                          title={val.messagePasser.storageRoot ?? ''}
+                        >
+                          StorageRoot:{' '}
+                          {val.messagePasser.storageRoot
+                            ? `${val.messagePasser.storageRoot.slice(0, 14)}...${val.messagePasser.storageRoot.slice(-6)}`
+                            : '—'}
+                        </div>
+                        <div>
+                          Merkle証明階層: {val.messagePasser.merkleProofNodes} nodes
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 5-Step Withdrawal Validation Logic Checklist */}
+                  {val && val.checks.length > 0 && (
+                    <div className="border border-slate-200 rounded-xl divide-y divide-slate-100">
+                      <div className="px-3.5 py-2 bg-slate-50/80 text-[11px] font-semibold text-slate-600">
+                        出金時オンチェーン・バリデーションロジック検証 ({val.checks.filter((c) => c.passed).length}/{val.checks.length} 合格)
+                      </div>
+                      {val.checks.map((chk) => (
+                        <div key={chk.id} className="px-3.5 py-2.5 space-y-0.5">
+                          <div className="flex items-center justify-between gap-2 text-xs">
+                            <span className="font-semibold text-slate-900">
+                              {chk.label}
+                            </span>
+                            <span
+                              className={`font-mono font-semibold shrink-0 ${
+                                chk.status === 'pass'
+                                  ? 'text-emerald-700'
+                                  : chk.status === 'warn'
+                                  ? 'text-amber-700'
+                                  : 'text-red-700'
+                              }`}
+                            >
+                              {chk.status === 'pass'
+                                ? 'PASS'
+                                : chk.status === 'warn'
+                                ? 'WARN'
+                                : 'FAIL'}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-600 leading-relaxed break-words">
+                            {chk.detail}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   <div className="text-xs text-slate-600 font-mono space-y-1 pt-2 border-t border-slate-100">
+                    <div className="flex justify-between gap-2">
+                      <span className="font-sans text-slate-500">
+                        L1 Prove 状態 (numProofSubmitters)
+                      </span>
+                      <span className="text-slate-900 font-semibold text-right">
+                        {val
+                          ? `${val.numProofSubmitters}件 (${val.proveStateLabel.split('（')[0]})`
+                          : '—'}
+                      </span>
+                    </div>
+                    {val?.proofSubmitter && (
+                      <div className="flex justify-between gap-2">
+                        <span className="font-sans text-slate-500">Prove 提出アドレス</span>
+                        <span className="truncate">{val.proofSubmitter}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between gap-2">
                       <span className="font-sans text-slate-500">
                         L1 OptimismPortal2.finalizedWithdrawals
@@ -388,12 +512,12 @@ export function TxInspectorDrawer({
                         className={
                           w.portalFinalized
                             ? 'text-emerald-700 font-semibold'
-                            : 'text-red-700 font-semibold'
+                            : 'text-slate-800 font-semibold'
                         }
                       >
                         {w.portalFinalized
-                          ? 'true (L1コード実行・出金完了済み)'
-                          : 'false (L1ファイナライズコード未実行)'}
+                          ? 'true (L1出金完了済)'
+                          : 'false (未消費 · Claim枠有効)'}
                       </span>
                     </div>
                     <div className="flex justify-between gap-2">
@@ -401,7 +525,7 @@ export function TxInspectorDrawer({
                       <span className="truncate">{w.l1Recipient}</span>
                     </div>
                     <div className="flex justify-between gap-2">
-                      <span className="font-sans text-slate-500">出金可能予定日時</span>
+                      <span className="font-sans text-slate-500">出金確定予定日時</span>
                       <span className="tabular-nums">
                         {w.estimatedClaimableAtMs
                           ? formatUnixTimestamp(Math.floor(w.estimatedClaimableAtMs / 1000))
@@ -410,32 +534,33 @@ export function TxInspectorDrawer({
                     </div>
                   </div>
 
-                  {!w.portalFinalized && (
-                    <p className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 leading-relaxed">
-                      ※ 上部の「L2 Finalized」はBaseのブロックデータがL1で確定した状態を指します。L1側で実際に資産を受け取るには、別途
-                      <span className="font-mono text-slate-800"> proveWithdrawalTransaction </span>
-                      および成熟待機後の
-                      <span className="font-mono text-slate-800"> finalizeWithdrawalTransaction </span>
-                      の実行が必要です。
-                    </p>
-                  )}
+                  <div className="pt-1 flex flex-wrap items-center gap-2.5">
+                    {onOpenInSimulator && !w.portalFinalized && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenInSimulator(result.hash)}
+                        className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer"
+                      >
+                        <Play className="w-3.5 h-3.5 fill-current" />
+                        <span>Pimlico / ウォレットで Prove・出金確定へ進む</span>
+                      </button>
+                    )}
 
-                  <div className="pt-1 flex flex-wrap items-center gap-3">
                     <button
                       type="button"
                       onClick={handleRunL1Sim}
                       disabled={isSimulating}
-                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-[#0052FF] hover:bg-blue-700 disabled:bg-slate-300 rounded-lg transition-colors cursor-pointer"
+                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors cursor-pointer"
                     >
                       {isSimulating ? (
                         <>
                           <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                          <span>L1シミュレーション中...</span>
+                          <span>最新L1状態で再検証中...</span>
                         </>
                       ) : (
                         <>
-                          <Play className="w-3.5 h-3.5 fill-current" />
-                          <span>L1出金シミュレーション実行</span>
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          <span>待機後着金・ガス代をL1再検証</span>
                         </>
                       )}
                     </button>

@@ -10,6 +10,7 @@ import {
   ReliabilityInfo,
   VerificationRunSummary,
   VerifiedTransactionResult,
+  WithdrawalInfo,
 } from './types/finality';
 import {
   NETWORK_PRESETS,
@@ -17,6 +18,7 @@ import {
   fetchLiveOnChainSamples,
   parseTxHashes,
   verifyTransactionsBatch,
+  verifyWithdrawalsOnlyBatch,
 } from './lib/baseRpc';
 import type { Hex } from 'viem';
 import {
@@ -27,7 +29,10 @@ import {
   clearFinalizedCache,
   getAllCachedFinalizedResults,
   getFinalizedCacheCount,
+  hasWithdrawalIndicator,
   isImmutableFinalizedResult,
+  isPartiallyFetchedOrBrokenResult,
+  isValidVerifiedResultForDb,
   lookupFinalizedCache,
   saveFinalizedResultsToCache,
 } from './lib/finalizedCache';
@@ -43,8 +48,8 @@ import { FinalityGuideSection } from './components/FinalityGuideSection';
 import { HistorySection } from './components/HistorySection';
 import { WithdrawalSimulatorSection } from './components/WithdrawalSimulatorSection';
 
-const HISTORY_STORAGE_KEY = 'base-finality-history-v1';
-const WORKSPACE_STORAGE_KEY = 'base-finality-workspace-v1';
+const HISTORY_STORAGE_KEY = 'base-finality-history-v2';
+const WORKSPACE_STORAGE_KEY = 'base-finality-workspace-v2';
 const AUTO_POLL_SECONDS = 15;
 
 const VALID_TABS = new Set<ActiveTab>([
@@ -78,6 +83,40 @@ interface PersistedWorkspaceState {
 }
 
 function fallbackReliability(r: Partial<VerifiedTransactionResult>): ReliabilityInfo {
+  const full = r as VerifiedTransactionResult;
+  if (hasWithdrawalIndicator(full)) {
+    if (!r.withdrawal || !r.withdrawal.validation || r.withdrawal.usedFallbackDelay) {
+      return {
+        tier: 'partial',
+        label: '未取得あり (要再取得)',
+        basis: ['L2ToL1MessagePasser ログ検出'],
+        caveat:
+          'L1 OptimismPortal2 の状態取得が未完了です。未取得項目を再取得してください。',
+      };
+    }
+    const cleanWithdrawalBasis = [
+      'L2ToL1MessagePasser (sentMessages & MPT証明)',
+      'L1 OptimismPortal2 (provenWithdrawals / checkWithdrawal / finalizedWithdrawals)',
+      'L1 DisputeGameFactory / AggregateVerifier (TEE・ZK)',
+    ];
+    if (
+      r.withdrawal.portalFinalized ||
+      r.withdrawal.status === 'ready-to-finalize'
+    ) {
+      return {
+        tier: 'verified_onchain',
+        label: 'OptimismPortal2 実測確定',
+        basis: cleanWithdrawalBasis,
+        caveat: null,
+      };
+    }
+    return {
+      tier: 'estimated_pending',
+      label: 'OptimismPortal2 検証済',
+      basis: cleanWithdrawalBasis,
+      caveat: null,
+    };
+  }
   if (r.reliability && r.reliability.tier && r.reliability.label) {
     return r.reliability;
   }
@@ -120,6 +159,7 @@ function normalizeResults(raw: unknown): VerifiedTransactionResult[] {
     .filter((r): r is VerifiedTransactionResult => Boolean(r && typeof r === 'object'))
     .map((r) => ({
       ...r,
+      hasWithdrawalLog: hasWithdrawalIndicator(r),
       reliability: fallbackReliability(r),
     }));
 }
@@ -127,6 +167,7 @@ function normalizeResults(raw: unknown): VerifiedTransactionResult[] {
 function compactResults(rows: VerifiedTransactionResult[]): VerifiedTransactionResult[] {
   return rows.slice(0, 500).map((r) => ({
     ...r,
+    hasWithdrawalLog: hasWithdrawalIndicator(r),
     rawTx: null,
     rawReceipt: null,
   }));
@@ -285,6 +326,7 @@ export default function App() {
   );
   const [isVerifyingWithdrawals, setIsVerifyingWithdrawals] = useState(false);
   const [isRetryingWithdrawalErrors, setIsRetryingWithdrawalErrors] = useState(false);
+  const [isRetryingSingle, setIsRetryingSingle] = useState(false);
   const [isLoadingWithdrawalTabSamples, setIsLoadingWithdrawalTabSamples] = useState(false);
   const [withdrawalVerifyError, setWithdrawalVerifyError] = useState<string | null>(null);
   const [withdrawalProgress, setWithdrawalProgress] = useState<{
@@ -388,23 +430,35 @@ export default function App() {
     lastRunCacheStats,
   ]);
 
-  const syncFinalizedToCloud = useCallback(
+  const persistValidResultsToDb = useCallback(
     (rows: VerifiedTransactionResult[]) => {
-      if (!authToken) return;
-      const immutableRows = rows.filter(isImmutableFinalizedResult);
-      if (immutableRows.length === 0) return;
+      const validRows = rows.filter(isValidVerifiedResultForDb);
+      if (validRows.length === 0) return;
+
+      const savedLocal = saveFinalizedResultsToCache(
+        activeNetworkConfig.id,
+        activeNetworkConfig.chainId,
+        validRows
+      );
+      if (savedLocal > 0) {
+        setCacheVersion((v) => v + 1);
+      }
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (authToken) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
 
       fetch('/api/tx-cache', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
+        headers,
         body: JSON.stringify({
-          items: immutableRows.map((r) => ({
+          items: validRows.map((r) => ({
             networkId: activeNetworkConfig.id,
             chainId: activeNetworkConfig.chainId,
-            txHash: r.hash,
+            txHash: r.hash.toLowerCase(),
             finality: r.finality,
             executionStatus: r.executionStatus,
             blockNumber: r.blockNumber,
@@ -412,13 +466,104 @@ export default function App() {
             isWithdrawal: r.withdrawal !== null,
             portalFinalized: r.withdrawal?.portalFinalized ?? null,
             reliabilityTier: r.reliability?.tier ?? 'verified_onchain',
-            payloadJson: { ...r, rawTx: null, rawReceipt: null },
+            payloadJson: {
+              ...r,
+              hasWithdrawalLog: hasWithdrawalIndicator(r),
+              rawTx: null,
+              rawReceipt: null,
+            },
           })),
         }),
       }).catch(() => {});
     },
     [authToken, activeNetworkConfig.id, activeNetworkConfig.chainId]
   );
+
+  const lookupDbVerifiedCache = useCallback(
+    async (hashes: string[]): Promise<Map<string, VerifiedTransactionResult>> => {
+      const resultMap = new Map<string, VerifiedTransactionResult>();
+      if (hashes.length === 0) return resultMap;
+
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (authToken) {
+          headers.Authorization = `Bearer ${authToken}`;
+        }
+
+        const res = await fetch('/api/tx-cache/lookup', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            networkId: activeNetworkConfig.id,
+            chainId: activeNetworkConfig.chainId,
+            hashes,
+          }),
+        });
+        if (!res.ok) return resultMap;
+
+        const data = await res.json();
+        const items = Array.isArray(data?.items)
+          ? normalizeResults(data.items)
+          : [];
+        const validItems = items.filter(isValidVerifiedResultForDb);
+        if (validItems.length > 0) {
+          const saved = saveFinalizedResultsToCache(
+            activeNetworkConfig.id,
+            activeNetworkConfig.chainId,
+            validItems
+          );
+          if (saved > 0) setCacheVersion((v) => v + 1);
+          for (const item of validItems) {
+            resultMap.set(item.hash.toLowerCase(), item);
+          }
+        }
+      } catch {
+        // Non-fatal DB lookup failure; falls back cleanly to live RPC
+      }
+      return resultMap;
+    },
+    [authToken, activeNetworkConfig.id, activeNetworkConfig.chainId]
+  );
+
+  // Hydrate immutable verified cache from DB on mount / network switch (works both signed-out and signed-in)
+  useEffect(() => {
+    let cancelled = false;
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers.Authorization = `Bearer ${authToken}`;
+    }
+
+    fetch(
+      `/api/tx-cache?networkId=${encodeURIComponent(
+        activeNetworkConfig.id
+      )}&chainId=${activeNetworkConfig.chainId}`,
+      { headers }
+    )
+      .then((res) => (res.ok ? res.json() : null))
+      .then((txData) => {
+        if (cancelled || !Array.isArray(txData?.items) || txData.items.length === 0) {
+          return;
+        }
+        const normalized = normalizeResults(txData.items).filter(
+          isValidVerifiedResultForDb
+        );
+        if (normalized.length > 0) {
+          const count = saveFinalizedResultsToCache(
+            activeNetworkConfig.id,
+            activeNetworkConfig.chainId,
+            normalized
+          );
+          if (count > 0) setCacheVersion((v) => v + 1);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeNetworkConfig.id, activeNetworkConfig.chainId, authToken]);
 
   // Bidirectional sync on Google sign-in: workspace, finalized cache, and verification history
   useEffect(() => {
@@ -431,29 +576,11 @@ export default function App() {
       activeNetworkConfig.chainId
     );
     if (localFinalized.length > 0) {
-      syncFinalizedToCloud(localFinalized);
+      persistValidResultsToDb(localFinalized);
     }
 
     const syncAll = async () => {
       try {
-        // 1. Sync Finalized cache
-        const txRes = await fetch(
-          `/api/tx-cache?networkId=${encodeURIComponent(
-            activeNetworkConfig.id
-          )}&chainId=${activeNetworkConfig.chainId}`,
-          { headers: { Authorization: `Bearer ${authToken}` } }
-        );
-        if (!cancelled && txRes.ok) {
-          const txData = await txRes.json();
-          if (Array.isArray(txData?.items) && txData.items.length > 0) {
-            const count = saveFinalizedResultsToCache(
-              activeNetworkConfig.id,
-              activeNetworkConfig.chainId,
-              txData.items as VerifiedTransactionResult[]
-            );
-            if (count > 0) setCacheVersion((v) => v + 1);
-          }
-        }
 
         // 2. Sync verification history (both directions)
         const runsRes = await fetch('/api/runs', {
@@ -560,7 +687,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authToken, activeNetworkConfig.id, activeNetworkConfig.chainId, syncFinalizedToCloud]);
+  }, [authToken, activeNetworkConfig.id, activeNetworkConfig.chainId, persistValidResultsToDb]);
 
   // Continuously push workspace changes to cloud once initial hydration completes
   useEffect(() => {
@@ -748,29 +875,77 @@ export default function App() {
 
       if (cancelled || updates.size === 0) return;
 
+      const updatedForDb: VerifiedTransactionResult[] = [];
+
       setResults((prev) =>
         prev.map((row) => {
           const nextW = updates.get(row.hash.toLowerCase());
-          return nextW ? { ...row, withdrawal: nextW } : row;
+          if (!nextW) return row;
+          const nextRow: VerifiedTransactionResult = {
+            ...row,
+            hasWithdrawalLog: true,
+            withdrawal: nextW,
+            reliability:
+              nextW.validation && !nextW.usedFallbackDelay
+                ? {
+                    tier: 'verified_onchain',
+                    label: nextW.portalFinalized
+                      ? 'L1出金完了を確認済'
+                      : 'OptimismPortal2 実測済',
+                    basis: [
+                      'L2ToL1MessagePasser.sentMessages + MPT証明',
+                      'L1 OptimismPortal2 & AggregateVerifier 直接照合',
+                    ],
+                    caveat: null,
+                  }
+                : row.reliability,
+          };
+          updatedForDb.push(nextRow);
+          return nextRow;
         })
       );
       setWithdrawalVerifyResults((prev) =>
         prev.map((row) => {
           const nextW = updates.get(row.hash.toLowerCase());
-          return nextW ? { ...row, withdrawal: nextW } : row;
+          if (!nextW) return row;
+          const nextRow: VerifiedTransactionResult = {
+            ...row,
+            hasWithdrawalLog: true,
+            withdrawal: nextW,
+            reliability:
+              nextW.validation && !nextW.usedFallbackDelay
+                ? {
+                    tier: 'verified_onchain',
+                    label: nextW.portalFinalized
+                      ? 'L1出金完了を確認済'
+                      : 'OptimismPortal2 実測済',
+                    basis: [
+                      'L2ToL1MessagePasser.sentMessages + MPT証明',
+                      'L1 OptimismPortal2 & AggregateVerifier 直接照合',
+                    ],
+                    caveat: null,
+                  }
+                : row.reliability,
+          };
+          updatedForDb.push(nextRow);
+          return nextRow;
         })
       );
       setSelectedResult((prev) => {
         if (!prev) return null;
         const nextW = updates.get(prev.hash.toLowerCase());
-        return nextW ? { ...prev, withdrawal: nextW } : prev;
+        return nextW ? { ...prev, hasWithdrawalLog: true, withdrawal: nextW } : prev;
       });
+
+      if (updatedForDb.length > 0) {
+        persistValidResultsToDb(updatedForDb);
+      }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [activeNetworkConfig, results, withdrawalVerifyResults]);
+  }, [activeNetworkConfig, results, withdrawalVerifyResults, persistValidResultsToDb]);
 
   const mergeWithdrawalsIntoTab = useCallback(
     (rows: VerifiedTransactionResult[], snap: ChainHeadSnapshot) => {
@@ -788,6 +963,11 @@ export default function App() {
     []
   );
 
+  const autoRetriedHashesRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    autoRetriedHashesRef.current.clear();
+  }, [networkId]);
+
   const runBatchVerification = useCallback(
     async (inputText?: string, saveToHistory = true, forceRefresh = false) => {
       const targetParsed = inputText !== undefined ? parseTxHashes(inputText) : parsedBatch;
@@ -802,16 +982,20 @@ export default function App() {
         return;
       }
 
+      for (const h of targetParsed.validHashes) {
+        autoRetriedHashesRef.current.delete(h.toLowerCase());
+      }
+
       setIsVerifying(true);
       setVerifyError(null);
       setProgress({
         completed: 0,
         total: targetParsed.validHashes.length,
-        phase: 'ローカル確定キャッシュを確認中...',
+        phase: '検証済みキャッシュを確認中...',
       });
 
       try {
-        const { cachedMap, missingHashes } = forceRefresh
+        const { cachedMap, missingHashes: localMissing } = forceRefresh
           ? {
               cachedMap: new Map<string, VerifiedTransactionResult>(),
               missingHashes: targetParsed.validHashes,
@@ -822,6 +1006,29 @@ export default function App() {
               targetParsed.validHashes,
               headSnapshot
             );
+
+        const activeDbFallbackMap = new Map<string, VerifiedTransactionResult>();
+        let missingHashes = localMissing;
+
+        if (!forceRefresh && localMissing.length > 0) {
+          const dbMap = await lookupDbVerifiedCache(localMissing);
+          if (dbMap.size > 0) {
+            const stillMissing: string[] = [];
+            for (const rawH of localMissing) {
+              const h = rawH.toLowerCase();
+              const dbRow = dbMap.get(h);
+              if (dbRow && isImmutableFinalizedResult(dbRow)) {
+                cachedMap.set(h, dbRow);
+              } else {
+                if (dbRow && isValidVerifiedResultForDb(dbRow)) {
+                  activeDbFallbackMap.set(h, dbRow);
+                }
+                stillMissing.push(rawH);
+              }
+            }
+            missingHashes = stillMissing;
+          }
+        }
 
         let activeSnapshot: ChainHeadSnapshot | null = headSnapshot;
         let fetchedRows: VerifiedTransactionResult[] = [];
@@ -844,14 +1051,13 @@ export default function App() {
           activeSnapshot = snapshot;
           fetchedRows = rpcResults;
         } else {
-          // All valid hashes are already Finalized & immutable in local cache!
           if (!activeSnapshot) {
             activeSnapshot = await fetchChainHeadSnapshot(activeNetworkConfig);
           }
           setProgress({
             completed: targetParsed.validHashes.length,
             total: targetParsed.validHashes.length,
-            phase: `ローカル確定データから ${cachedMap.size}件を復元完了（RPC新規取得なし）`,
+            phase: `保存済み確定データから ${cachedMap.size}件を復元完了（RPC新規取得なし）`,
           });
         }
 
@@ -861,7 +1067,13 @@ export default function App() {
           if (r.finality === FinalityStage.INVALID) {
             invalidRows.push(r);
           } else {
-            fetchedValidMap.set(r.hash.toLowerCase(), r);
+            const h = r.hash.toLowerCase();
+            const dbFallback = activeDbFallbackMap.get(h);
+            if (isPartiallyFetchedOrBrokenResult(r) && dbFallback) {
+              fetchedValidMap.set(h, dbFallback);
+            } else {
+              fetchedValidMap.set(h, r);
+            }
           }
         }
 
@@ -878,6 +1090,7 @@ export default function App() {
                 : row.confirmations;
             mergedRows.push({
               ...row,
+              hasWithdrawalLog: hasWithdrawalIndicator(row),
               index: rowIdx++,
               confirmations: refreshedConf,
             });
@@ -887,16 +1100,8 @@ export default function App() {
           mergedRows.push({ ...inv, index: rowIdx++ });
         }
 
-        // Persist any newly Finalized immutable results to local cache (+ cloud if signed in)
-        const savedCount = saveFinalizedResultsToCache(
-          activeNetworkConfig.id,
-          activeNetworkConfig.chainId,
-          mergedRows
-        );
-        if (savedCount > 0) {
-          setCacheVersion((v) => v + 1);
-          syncFinalizedToCloud(mergedRows);
-        }
+        // Persist all cleanly verified results (never partial/broken rows)
+        persistValidResultsToDb(mergedRows);
 
         setLastRunCacheStats({
           reusedFromLocal: cachedMap.size,
@@ -911,7 +1116,11 @@ export default function App() {
         setResults(mergedRows);
 
         setSelectedResult((prev) =>
-          prev ? mergedRows.find((r) => r.hash === prev.hash) ?? null : null
+          prev
+            ? mergedRows.find(
+                (r) => r.hash.toLowerCase() === prev.hash.toLowerCase()
+              ) ?? null
+            : null
         );
 
         if (saveToHistory && mergedRows.length > 0 && activeSnapshot) {
@@ -925,7 +1134,8 @@ export default function App() {
               (r) =>
                 r.finality === FinalityStage.NOT_FOUND ||
                 r.finality === FinalityStage.INVALID ||
-                r.finality === FinalityStage.RPC_ERROR
+                r.finality === FinalityStage.RPC_ERROR ||
+                isPartiallyFetchedOrBrokenResult(r)
             ).length,
             reverted: mergedRows.filter(
               (r) => r.executionStatus === ExecutionStatus.REVERTED
@@ -951,7 +1161,7 @@ export default function App() {
               },
               body: JSON.stringify({
                 ...entry,
-                results: entry.results.map((r) => ({ ...r, rawTx: null, rawReceipt: null })),
+                results: compactResults(entry.results),
               }),
             }).catch(() => {});
           }
@@ -974,8 +1184,9 @@ export default function App() {
       parsedBatch,
       activeNetworkConfig,
       headSnapshot,
+      lookupDbVerifiedCache,
       mergeWithdrawalsIntoTab,
-      syncFinalizedToCloud,
+      persistValidResultsToDb,
       authToken,
     ]
   );
@@ -1085,15 +1296,7 @@ export default function App() {
           activeNetworkConfig
         );
 
-        const savedCount = saveFinalizedResultsToCache(
-          activeNetworkConfig.id,
-          activeNetworkConfig.chainId,
-          retriedRows
-        );
-        if (savedCount > 0) {
-          setCacheVersion((v) => v + 1);
-          syncFinalizedToCloud(retriedRows);
-        }
+        persistValidResultsToDb(retriedRows);
 
         const retriedMap = new Map(retriedRows.map((r) => [r.hash.toLowerCase(), r]));
         setHeadSnapshot(snapshot);
@@ -1107,21 +1310,47 @@ export default function App() {
           prev.map((existing) => {
             const replacement = retriedMap.get(existing.hash.toLowerCase());
             if (!replacement) return existing;
-            return { ...replacement, index: existing.index };
+            if (
+              isValidVerifiedResultForDb(existing) &&
+              isPartiallyFetchedOrBrokenResult(replacement)
+            ) {
+              return existing;
+            }
+            return {
+              ...replacement,
+              hasWithdrawalLog: hasWithdrawalIndicator(replacement),
+              index: existing.index,
+            };
           })
         );
+        setSelectedResult((prev) => {
+          if (!prev) return null;
+          const replacement = retriedMap.get(prev.hash.toLowerCase());
+          if (!replacement) return prev;
+          if (
+            isValidVerifiedResultForDb(prev) &&
+            isPartiallyFetchedOrBrokenResult(replacement)
+          ) {
+            return prev;
+          }
+          return {
+            ...replacement,
+            hasWithdrawalLog: hasWithdrawalIndicator(replacement),
+            index: prev.index,
+          };
+        });
       } catch (err) {
         setVerifyError(
-          err instanceof Error ? err.message : 'エラー項目の再検証に失敗しました'
+          err instanceof Error ? err.message : '未取得・部分照合項目の再取得に失敗しました'
         );
       } finally {
         setIsRetryingErrors(false);
       }
     },
-    [activeNetworkConfig, mergeWithdrawalsIntoTab, results.length, syncFinalizedToCloud]
+    [activeNetworkConfig, mergeWithdrawalsIntoTab, results.length, persistValidResultsToDb]
   );
 
-  // Dedicated Withdrawal Tab Handlers
+  // Dedicated Withdrawal Tab Handlers (strictly real OP Stack withdrawal checks only)
   const runWithdrawalTabVerification = useCallback(
     async (inputText?: string) => {
       const targetParsed =
@@ -1137,36 +1366,135 @@ export default function App() {
         return;
       }
 
+      for (const h of targetParsed.validHashes) {
+        autoRetriedHashesRef.current.delete(h.toLowerCase());
+      }
+
       setIsVerifyingWithdrawals(true);
       setWithdrawalVerifyError(null);
       setWithdrawalProgress({
         completed: 0,
         total: targetParsed.validHashes.length,
-        phase: '出金TxのL1/L2状態を取得中...',
+        phase: '検証済み出金キャッシュを確認中...',
       });
 
       try {
-        const { snapshot, results: verifiedRows } = await verifyTransactionsBatch(
-          targetParsed,
-          activeNetworkConfig,
-          (completed, total, phase) => {
-            setWithdrawalProgress({ completed, total, phase });
-          }
-        );
-
-        const savedCount = saveFinalizedResultsToCache(
+        const { cachedMap, missingHashes: localMissing } = lookupFinalizedCache(
           activeNetworkConfig.id,
           activeNetworkConfig.chainId,
-          verifiedRows
+          targetParsed.validHashes,
+          withdrawalSnapshot ?? headSnapshot
         );
-        if (savedCount > 0) {
-          setCacheVersion((v) => v + 1);
-          syncFinalizedToCloud(verifiedRows);
+
+        const immutableWithdrawalCache = new Map<string, VerifiedTransactionResult>();
+        const hashesAfterLocal: string[] = [];
+        for (const rawH of targetParsed.validHashes) {
+          const h = rawH.toLowerCase();
+          const localHit = cachedMap.get(h);
+          if (localHit && localHit.withdrawal?.portalFinalized === true && isImmutableFinalizedResult(localHit)) {
+            immutableWithdrawalCache.set(h, localHit);
+          } else {
+            hashesAfterLocal.push(rawH);
+          }
         }
 
-        setHeadSnapshot(snapshot);
-        setWithdrawalSnapshot(snapshot);
-        setWithdrawalVerifyResults(verifiedRows);
+        const activeDbFallbackMap = new Map<string, VerifiedTransactionResult>();
+        let missingHashes = hashesAfterLocal;
+
+        if (localMissing.length > 0 || hashesAfterLocal.length > 0) {
+          const dbMap = await lookupDbVerifiedCache(hashesAfterLocal);
+          if (dbMap.size > 0) {
+            const stillMissing: string[] = [];
+            for (const rawH of hashesAfterLocal) {
+              const h = rawH.toLowerCase();
+              const dbRow = dbMap.get(h);
+              if (
+                dbRow &&
+                dbRow.withdrawal?.portalFinalized === true &&
+                isImmutableFinalizedResult(dbRow)
+              ) {
+                immutableWithdrawalCache.set(h, dbRow);
+              } else {
+                if (dbRow && isValidVerifiedResultForDb(dbRow)) {
+                  activeDbFallbackMap.set(h, dbRow);
+                }
+                stillMissing.push(rawH);
+              }
+            }
+            missingHashes = stillMissing;
+          }
+        }
+
+        let activeSnapshot: ChainHeadSnapshot | null = withdrawalSnapshot ?? headSnapshot;
+        let rpcResults: VerifiedTransactionResult[] = [];
+
+        if (missingHashes.length > 0 || targetParsed.invalidTokens.length > 0) {
+          const rpcBatch = {
+            validHashes: missingHashes,
+            invalidTokens: targetParsed.invalidTokens,
+            duplicateCount: targetParsed.duplicateCount,
+            totalLinesOrTokens: missingHashes.length + targetParsed.invalidTokens.length,
+          };
+
+          const verified = await verifyWithdrawalsOnlyBatch(
+            rpcBatch,
+            activeNetworkConfig,
+            (completed, total, phase) => {
+              setWithdrawalProgress({ completed, total, phase });
+            }
+          );
+          activeSnapshot = verified.snapshot;
+          rpcResults = verified.results;
+        } else if (!activeSnapshot) {
+          activeSnapshot = await fetchChainHeadSnapshot(activeNetworkConfig);
+        }
+
+        const fetchedValidMap = new Map<string, VerifiedTransactionResult>();
+        const invalidRows: VerifiedTransactionResult[] = [];
+        for (const r of rpcResults) {
+          if (r.finality === FinalityStage.INVALID) {
+            invalidRows.push(r);
+          } else {
+            const h = r.hash.toLowerCase();
+            const dbFallback = activeDbFallbackMap.get(h);
+            if (isPartiallyFetchedOrBrokenResult(r) && dbFallback) {
+              fetchedValidMap.set(h, dbFallback);
+            } else {
+              fetchedValidMap.set(h, r);
+            }
+          }
+        }
+
+        const mergedRows: VerifiedTransactionResult[] = [];
+        let rowIdx = 1;
+        for (const rawH of targetParsed.validHashes) {
+          const h = rawH.toLowerCase();
+          const row = fetchedValidMap.get(h) ?? immutableWithdrawalCache.get(h);
+          if (row) {
+            mergedRows.push({
+              ...row,
+              hasWithdrawalLog: hasWithdrawalIndicator(row),
+              index: rowIdx++,
+            });
+          }
+        }
+        for (const inv of invalidRows) {
+          mergedRows.push({ ...inv, index: rowIdx++ });
+        }
+
+        persistValidResultsToDb(mergedRows);
+
+        if (activeSnapshot) {
+          setWithdrawalSnapshot(activeSnapshot);
+        }
+        setWithdrawalVerifyResults(mergedRows);
+        setSelectedResult((prev) =>
+          prev
+            ? mergedRows.find(
+                (r) => r.hash.toLowerCase() === prev.hash.toLowerCase()
+              ) ?? prev
+            : null
+        );
       } catch (err) {
         setWithdrawalVerifyError(
           err instanceof Error ? err.message : '出金検証中にRPCエラーが発生しました'
@@ -1175,7 +1503,14 @@ export default function App() {
         setIsVerifyingWithdrawals(false);
       }
     },
-    [parsedWithdrawalBatch, activeNetworkConfig, syncFinalizedToCloud]
+    [
+      parsedWithdrawalBatch,
+      activeNetworkConfig,
+      withdrawalSnapshot,
+      headSnapshot,
+      lookupDbVerifiedCache,
+      persistValidResultsToDb,
+    ]
   );
 
   const handleFetchWithdrawalTabSamples = async () => {
@@ -1216,39 +1551,383 @@ export default function App() {
           duplicateCount: 0,
           totalLinesOrTokens: hashesToRetry.length,
         };
-        const { snapshot, results: retriedRows } = await verifyTransactionsBatch(
+        const { snapshot, results: retriedRows } = await verifyWithdrawalsOnlyBatch(
           retryParsed,
           activeNetworkConfig
         );
-        const savedCount = saveFinalizedResultsToCache(
-          activeNetworkConfig.id,
-          activeNetworkConfig.chainId,
-          retriedRows
-        );
-        if (savedCount > 0) {
-          setCacheVersion((v) => v + 1);
-          syncFinalizedToCloud(retriedRows);
-        }
+        persistValidResultsToDb(retriedRows);
         const retriedMap = new Map(retriedRows.map((r) => [r.hash.toLowerCase(), r]));
-        setHeadSnapshot(snapshot);
         setWithdrawalSnapshot(snapshot);
         setWithdrawalVerifyResults((prev) =>
           prev.map((existing) => {
             const replacement = retriedMap.get(existing.hash.toLowerCase());
             if (!replacement) return existing;
-            return { ...replacement, index: existing.index };
+            if (
+              isValidVerifiedResultForDb(existing) &&
+              isPartiallyFetchedOrBrokenResult(replacement)
+            ) {
+              return existing;
+            }
+            return {
+              ...replacement,
+              hasWithdrawalLog: hasWithdrawalIndicator(replacement),
+              index: existing.index,
+            };
           })
         );
+        setResults((prev) =>
+          prev.map((existing) => {
+            const replacement = retriedMap.get(existing.hash.toLowerCase());
+            if (!replacement) return existing;
+            if (
+              isValidVerifiedResultForDb(existing) &&
+              isPartiallyFetchedOrBrokenResult(replacement)
+            ) {
+              return existing;
+            }
+            const nowIsWithdrawal = hasWithdrawalIndicator(replacement);
+            return {
+              ...existing,
+              hasWithdrawalLog: nowIsWithdrawal,
+              withdrawal: nowIsWithdrawal ? replacement.withdrawal : null,
+              reliability: replacement.reliability,
+              errorReason: replacement.errorReason,
+            };
+          })
+        );
+        setHistory((prev) => {
+          let changed = false;
+          const next = prev.map((run) => {
+            let runChanged = false;
+            const nextResults = run.results.map((existing) => {
+              const replacement = retriedMap.get(existing.hash.toLowerCase());
+              if (!replacement || isPartiallyFetchedOrBrokenResult(replacement)) {
+                return existing;
+              }
+              runChanged = true;
+              changed = true;
+              const nowIsWithdrawal = hasWithdrawalIndicator(replacement);
+              return {
+                ...existing,
+                hasWithdrawalLog: nowIsWithdrawal,
+                withdrawal: nowIsWithdrawal ? replacement.withdrawal : null,
+                reliability: replacement.reliability,
+                errorReason: replacement.errorReason,
+              };
+            });
+            return runChanged ? { ...run, results: nextResults } : run;
+          });
+          if (changed) {
+            saveHistoryToStorage(next);
+          }
+          return changed ? next : prev;
+        });
+        setSelectedResult((prev) => {
+          if (!prev) return null;
+          const replacement = retriedMap.get(prev.hash.toLowerCase());
+          if (!replacement) return prev;
+          if (
+            isValidVerifiedResultForDb(prev) &&
+            isPartiallyFetchedOrBrokenResult(replacement)
+          ) {
+            return prev;
+          }
+          return {
+            ...replacement,
+            hasWithdrawalLog: hasWithdrawalIndicator(replacement),
+            index: prev.index,
+          };
+        });
       } catch (err) {
         setWithdrawalVerifyError(
-          err instanceof Error ? err.message : 'エラー項目の再検証に失敗しました'
+          err instanceof Error ? err.message : '未取得・部分照合項目の再取得に失敗しました'
         );
       } finally {
         setIsRetryingWithdrawalErrors(false);
       }
     },
-    [activeNetworkConfig, syncFinalizedToCloud]
+    [activeNetworkConfig, persistValidResultsToDb]
   );
+
+  const handleRetrySingleHash = useCallback(
+    async (hash: string) => {
+      const lower = hash.toLowerCase();
+      if (!/^0x[0-9a-f]{64}$/.test(lower)) return;
+      if (activeNetworkConfig.rpcUrls.length === 0) return;
+
+      setIsRetryingSingle(true);
+      try {
+        const existingRow =
+          withdrawalVerifyResults.find((r) => r.hash.toLowerCase() === lower) ??
+          results.find((r) => r.hash.toLowerCase() === lower) ??
+          selectedResult;
+        const treatAsWithdrawal =
+          activeTab === 'withdrawal-verify' ||
+          Boolean(existingRow && hasWithdrawalIndicator(existingRow));
+
+        const singleBatch = {
+          validHashes: [lower],
+          invalidTokens: [],
+          duplicateCount: 0,
+          totalLinesOrTokens: 1,
+        };
+
+        const { results: retriedRows } = treatAsWithdrawal
+          ? await verifyWithdrawalsOnlyBatch(singleBatch, activeNetworkConfig)
+          : await verifyTransactionsBatch(singleBatch, activeNetworkConfig);
+
+        const refreshed = retriedRows[0];
+        if (!refreshed) return;
+
+        persistValidResultsToDb([refreshed]);
+
+        setWithdrawalVerifyResults((prev) =>
+          prev.map((row) =>
+            row.hash.toLowerCase() === lower
+              ? {
+                  ...refreshed,
+                  hasWithdrawalLog: hasWithdrawalIndicator(refreshed),
+                  index: row.index,
+                }
+              : row
+          )
+        );
+        setResults((prev) =>
+          prev.map((row) =>
+            row.hash.toLowerCase() === lower
+              ? treatAsWithdrawal
+                ? {
+                    ...row,
+                    hasWithdrawalLog: hasWithdrawalIndicator(refreshed),
+                    withdrawal: refreshed.withdrawal ?? row.withdrawal,
+                    reliability: refreshed.reliability,
+                    errorReason: refreshed.errorReason,
+                  }
+                : {
+                    ...refreshed,
+                    hasWithdrawalLog: hasWithdrawalIndicator(refreshed),
+                    index: row.index,
+                  }
+              : row
+          )
+        );
+        setSelectedResult((prev) =>
+          prev && prev.hash.toLowerCase() === lower
+            ? {
+                ...refreshed,
+                hasWithdrawalLog: hasWithdrawalIndicator(refreshed),
+                index: prev.index,
+              }
+            : prev
+        );
+      } catch {
+        // Handled by UI state
+      } finally {
+        setIsRetryingSingle(false);
+      }
+    },
+    [
+      activeNetworkConfig,
+      activeTab,
+      withdrawalVerifyResults,
+      results,
+      selectedResult,
+      persistValidResultsToDb,
+    ]
+  );
+
+  const handleWithdrawalUpdatedGlobal = useCallback(
+    (txHash: string, info: WithdrawalInfo) => {
+      const lower = txHash.toLowerCase();
+      if (!/^0x[0-9a-f]{64}$/.test(lower)) return;
+
+      const nextReliability: ReliabilityInfo =
+        info.validation && !info.usedFallbackDelay
+          ? {
+              tier: 'verified_onchain',
+              label: info.portalFinalized
+                ? 'L1出金完了を確認済'
+                : 'OptimismPortal2 実測済',
+              basis: [
+                'L2ToL1MessagePasser.sentMessages + MPT証明',
+                'L1 OptimismPortal2 & AggregateVerifier 直接照合',
+              ],
+              caveat: null,
+            }
+          : {
+              tier: 'partial',
+              label: '未取得あり (要再取得)',
+              basis: ['L2ToL1MessagePasser ログ検出'],
+              caveat:
+                'L1 OptimismPortal2 の状態取得が未完了です。未取得項目を再取得してください。',
+            };
+
+      let matchedRow: VerifiedTransactionResult | null = null;
+
+      setWithdrawalVerifyResults((prev) =>
+        prev.map((row) => {
+          if (row.hash.toLowerCase() !== lower) return row;
+          const updated: VerifiedTransactionResult = {
+            ...row,
+            hasWithdrawalLog: true,
+            withdrawal: info,
+            reliability: nextReliability,
+            errorReason: null,
+          };
+          matchedRow = updated;
+          return updated;
+        })
+      );
+
+      setResults((prev) =>
+        prev.map((row) => {
+          if (row.hash.toLowerCase() !== lower) return row;
+          const updated: VerifiedTransactionResult = {
+            ...row,
+            hasWithdrawalLog: true,
+            withdrawal: info,
+            reliability: nextReliability,
+            errorReason: null,
+          };
+          if (!matchedRow) matchedRow = updated;
+          return updated;
+        })
+      );
+
+      setSelectedResult((prev) =>
+        prev && prev.hash.toLowerCase() === lower
+          ? {
+              ...prev,
+              hasWithdrawalLog: true,
+              withdrawal: info,
+              reliability: nextReliability,
+              errorReason: null,
+            }
+          : prev
+      );
+
+      if (matchedRow) {
+        persistValidResultsToDb([matchedRow]);
+      } else if (info.validation && !info.usedFallbackDelay) {
+        const syntheticRow: VerifiedTransactionResult = {
+          index: 1,
+          inputToken: lower,
+          hash: lower,
+          finality: FinalityStage.FINALIZED,
+          executionStatus: ExecutionStatus.SUCCESS,
+          blockNumber: null,
+          blockHash: null,
+          blockTimestamp: null,
+          txIndex: null,
+          from: info.sender,
+          to: info.target,
+          nonce: null,
+          valueEth: info.assetType === 'ETH' ? info.amountFormatted : null,
+          confirmations: null,
+          blocksToSafe: 0,
+          blocksToFinalized: 0,
+          l1OriginBlock: null,
+          l1OriginIsFinalized: null,
+          gasUsed: null,
+          l2FeeEth: null,
+          l1FeeEth: null,
+          totalFeeEth: null,
+          logsCount: null,
+          txType: null,
+          errorReason: null,
+          hasWithdrawalLog: true,
+          rawTx: null,
+          rawReceipt: null,
+          withdrawal: info,
+          reliability: nextReliability,
+        };
+        persistValidResultsToDb([syntheticRow]);
+      }
+    },
+    [persistValidResultsToDb]
+  );
+
+  // Automatic background re-acquisition for any partially unfetched items
+  useEffect(() => {
+    if (
+      isVerifying ||
+      isVerifyingWithdrawals ||
+      isRetryingErrors ||
+      isRetryingWithdrawalErrors ||
+      isRetryingSingle
+    ) {
+      return;
+    }
+    if (activeNetworkConfig.rpcUrls.length === 0) return;
+
+    const partialWithdrawalHashes: string[] = [];
+    const partialBatchHashes: string[] = [];
+
+    const considerRow = (r: VerifiedTransactionResult) => {
+      const h = r.hash.toLowerCase();
+      if (!/^0x[0-9a-f]{64}$/.test(h)) return;
+      if (!isPartiallyFetchedOrBrokenResult(r)) return;
+      if (autoRetriedHashesRef.current.has(h)) return;
+      if (
+        partialWithdrawalHashes.includes(h) ||
+        partialBatchHashes.includes(h)
+      ) {
+        return;
+      }
+
+      if (hasWithdrawalIndicator(r)) {
+        if (partialWithdrawalHashes.length < 10) {
+          partialWithdrawalHashes.push(h);
+        }
+      } else if (partialBatchHashes.length < 10) {
+        partialBatchHashes.push(h);
+      }
+    };
+
+    if (selectedResult) {
+      considerRow(selectedResult);
+    }
+    for (const r of withdrawalVerifyResults) {
+      considerRow(r);
+    }
+    for (const r of results) {
+      considerRow(r);
+    }
+
+    if (partialWithdrawalHashes.length === 0 && partialBatchHashes.length === 0) {
+      return;
+    }
+
+    for (const h of partialWithdrawalHashes) {
+      autoRetriedHashesRef.current.add(h);
+    }
+    for (const h of partialBatchHashes) {
+      autoRetriedHashesRef.current.add(h);
+    }
+
+    const timer = setTimeout(() => {
+      if (partialWithdrawalHashes.length > 0) {
+        handleRetryWithdrawalErrors(partialWithdrawalHashes);
+      }
+      if (partialBatchHashes.length > 0) {
+        handleRetryErrors(partialBatchHashes);
+      }
+    }, 300);
+
+    return () => clearTimeout(timer);
+  }, [
+    selectedResult,
+    results,
+    withdrawalVerifyResults,
+    isVerifying,
+    isVerifyingWithdrawals,
+    isRetryingErrors,
+    isRetryingWithdrawalErrors,
+    isRetryingSingle,
+    activeNetworkConfig.rpcUrls.length,
+    handleRetryWithdrawalErrors,
+    handleRetryErrors,
+  ]);
 
   const handleClear = () => {
     setRawInput('');
@@ -1446,17 +2125,19 @@ export default function App() {
                 clearFinalizedCache(activeNetworkConfig.id, activeNetworkConfig.chainId);
                 setCacheVersion((v) => v + 1);
                 setLastRunCacheStats(null);
+                const headers: Record<string, string> = {};
                 if (authToken) {
-                  fetch(
-                    `/api/tx-cache?networkId=${encodeURIComponent(
-                      activeNetworkConfig.id
-                    )}&chainId=${activeNetworkConfig.chainId}`,
-                    {
-                      method: 'DELETE',
-                      headers: { Authorization: `Bearer ${authToken}` },
-                    }
-                  ).catch(() => {});
+                  headers.Authorization = `Bearer ${authToken}`;
                 }
+                fetch(
+                  `/api/tx-cache?networkId=${encodeURIComponent(
+                    activeNetworkConfig.id
+                  )}&chainId=${activeNetworkConfig.chainId}`,
+                  {
+                    method: 'DELETE',
+                    headers,
+                  }
+                ).catch(() => {});
               }}
               onForceRefreshAll={() => runBatchVerification(undefined, true, true)}
             />
@@ -1529,6 +2210,7 @@ export default function App() {
             networkConfig={activeNetworkConfig}
             verifiedWithdrawals={verifiedWithdrawals}
             initialTxHash={simulatorInitialHash}
+            onValidWithdrawalAnalyzed={handleWithdrawalUpdatedGlobal}
           />
         )}
 
@@ -1582,7 +2264,7 @@ export default function App() {
             Base Finality · オンチェーンJSON-RPC直接検証コンソール
           </span>
           <span className="font-mono">
-            OP Stack Finality: Latest → Safe (L1 Batch) → Finalized (L1 Casper FFG)
+            OP Stack: L2 Finality (Safe / Finalized) · L1 OptimismPortal2 &amp; AggregateVerifier
           </span>
         </div>
       </footer>
@@ -1594,6 +2276,9 @@ export default function App() {
         explorerUrl={activeNetworkConfig.explorerUrl}
         l1ExplorerUrl={activeNetworkConfig.l1ExplorerUrl}
         onClose={() => setSelectedResult(null)}
+        onRetrySingleHash={handleRetrySingleHash}
+        isRetryingSingle={isRetryingSingle}
+        onWithdrawalUpdatedGlobal={handleWithdrawalUpdatedGlobal}
         onOpenInSimulator={(txHash) => {
           setSelectedResult(null);
           setSimulatorInitialHash(txHash);

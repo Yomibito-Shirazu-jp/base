@@ -1,4 +1,4 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
   chatMessages,
@@ -98,7 +98,8 @@ export async function getVerifiedTxsForUser(
         and(
           eq(verifiedTxs.userId, userId),
           eq(verifiedTxs.networkId, networkId),
-          eq(verifiedTxs.chainId, chainId)
+          eq(verifiedTxs.chainId, chainId),
+          ne(verifiedTxs.reliabilityTier, 'partial')
         )
       )
       .orderBy(desc(verifiedTxs.updatedAt))
@@ -106,6 +107,85 @@ export async function getVerifiedTxsForUser(
   } catch (error) {
     console.error('Database error fetching verified txs:', error);
     throw new Error('Failed to load saved transactions.', { cause: error });
+  }
+}
+
+export async function getVerifiedTxsForUsers(
+  userIds: number[],
+  networkId: string,
+  chainId: number
+) {
+  if (userIds.length === 0) return [];
+  try {
+    return await db
+      .select()
+      .from(verifiedTxs)
+      .where(
+        and(
+          inArray(verifiedTxs.userId, userIds),
+          eq(verifiedTxs.networkId, networkId),
+          eq(verifiedTxs.chainId, chainId),
+          ne(verifiedTxs.reliabilityTier, 'partial')
+        )
+      )
+      .orderBy(desc(verifiedTxs.updatedAt))
+      .limit(500);
+  } catch (error) {
+    console.error('Database error fetching verified txs for users:', error);
+    throw new Error('Failed to load saved transactions.', { cause: error });
+  }
+}
+
+export async function getVerifiedTxsByHashes(
+  userIds: number[],
+  networkId: string,
+  chainId: number,
+  txHashes: string[]
+) {
+  const normalizedHashes = Array.from(
+    new Set(
+      txHashes
+        .map((h) => h.trim().toLowerCase())
+        .filter((h) => /^0x[0-9a-fA-F]{64}$/.test(h))
+    )
+  ).slice(0, 500);
+
+  if (userIds.length === 0 || normalizedHashes.length === 0) return [];
+
+  try {
+    return await db
+      .select()
+      .from(verifiedTxs)
+      .where(
+        and(
+          inArray(verifiedTxs.userId, userIds),
+          eq(verifiedTxs.networkId, networkId),
+          eq(verifiedTxs.chainId, chainId),
+          inArray(verifiedTxs.txHash, normalizedHashes),
+          ne(verifiedTxs.reliabilityTier, 'partial')
+        )
+      )
+      .orderBy(desc(verifiedTxs.updatedAt));
+  } catch (error) {
+    console.error('Database error looking up verified txs by hashes:', error);
+    throw new Error('Failed to look up verified transactions.', { cause: error });
+  }
+}
+
+export async function purgePartialVerifiedTxsForUsers(userIds: number[]) {
+  if (userIds.length === 0) return;
+  try {
+    await db
+      .delete(verifiedTxs)
+      .where(
+        and(
+          inArray(verifiedTxs.userId, userIds),
+          eq(verifiedTxs.reliabilityTier, 'partial')
+        )
+      );
+  } catch (error) {
+    console.error('Database error purging partial verified txs:', error);
+    throw new Error('Failed to purge incomplete transactions.', { cause: error });
   }
 }
 

@@ -247,14 +247,21 @@ export function PimlicoExecutionPanel({
     );
   }, [withdrawalInfo, val, activeTeeZk, nowMs, elapsedSecSinceAnalyzed]);
 
+  const isZeroPayoutBlocked =
+    !withdrawalInfo.portalFinalized &&
+    (val?.canWithdrawAfterWait === false ||
+      val?.recipientBalanceIncreased === false);
+
   const canProveNow =
     !withdrawalInfo.portalFinalized &&
+    !isZeroPayoutBlocked &&
     (withdrawalInfo.status === 'ready-to-prove' ||
       val?.proveState === 'unproven-ready' ||
       val?.proveState === 'invalid-need-reprove');
 
   const canFinalizeNow =
     !withdrawalInfo.portalFinalized &&
+    !isZeroPayoutBlocked &&
     (withdrawalInfo.status === 'ready-to-finalize' ||
       val?.proveState === 'proven-ready' ||
       ((val?.numProofSubmitters ?? 0) > 0 &&
@@ -600,7 +607,9 @@ export function PimlicoExecutionPanel({
           {/* Step 3: Ethereum L1 Finalize / Receive Funds */}
           <div
             className={`p-3.5 space-y-1 ${
-              withdrawalInfo.portalFinalized || canFinalizeNow
+              isZeroPayoutBlocked
+                ? 'bg-red-50/50'
+                : withdrawalInfo.portalFinalized || canFinalizeNow
                 ? 'bg-emerald-50/40'
                 : 'bg-slate-50/40'
             }`}
@@ -611,21 +620,31 @@ export function PimlicoExecutionPanel({
               </span>
               <span
                 className={`font-bold whitespace-nowrap ${
-                  withdrawalInfo.portalFinalized || canFinalizeNow
+                  isZeroPayoutBlocked
+                    ? 'text-red-700'
+                    : withdrawalInfo.portalFinalized || canFinalizeNow
                     ? 'text-emerald-700'
                     : 'text-slate-600'
                 }`}
               >
                 {withdrawalInfo.portalFinalized
                   ? '受取完了 ✓'
+                  : isZeroPayoutBlocked
+                  ? '着金不可 (受取 0)'
                   : canFinalizeNow
                   ? '今すぐ受取可 ✓'
                   : '待機中'}
               </span>
             </div>
-            <div className="text-[11px] font-mono tabular-nums text-slate-700">
+            <div
+              className={`text-[11px] font-mono tabular-nums ${
+                isZeroPayoutBlocked ? 'text-red-800' : 'text-slate-700'
+              }`}
+            >
               {withdrawalInfo.portalFinalized
                 ? 'finalizedWithdrawals = true'
+                : isZeroPayoutBlocked
+                ? 'Finalizeを実行しないでください（L1ガス代のみ消費）'
                 : canFinalizeNow
                 ? '全待機期間クリア · 着金実行可能'
                 : proveMeta.isProven
@@ -867,28 +886,35 @@ export function PimlicoExecutionPanel({
               </span>
               <span
                 className={`text-xs font-semibold shrink-0 ${
-                  activeSim
+                  withdrawalInfo.portalFinalized
+                    ? 'text-emerald-700'
+                    : activeSim
                     ? activeSim.finalizeSim.passed
                       ? 'text-emerald-700'
                       : 'text-red-700'
                     : val?.canWithdrawAfterWait
                     ? 'text-emerald-700'
-                    : 'text-amber-700'
+                    : 'text-red-700'
                 }`}
               >
-                {activeSim
+                {withdrawalInfo.portalFinalized
+                  ? '資金受取完了済'
+                  : activeSim
                   ? activeSim.finalizeSim.alreadyCompletedOnChain
                     ? '資金受取完了済'
-                    : activeSim.finalizeSim.executableNow
+                    : activeSim.finalizeSim.executableNow &&
+                      activeSim.finalizeSim.passed
                     ? 'PASS (今すぐ資金受取可)'
                     : activeSim.finalizeSim.passed
-                    ? 'PASS (待機後に着金確実)'
-                    : '要確認'
-                  : withdrawalInfo.portalFinalized
-                  ? '資金受取完了済'
+                    ? 'PASS (実測L1着金確認済)'
+                    : val?.recipientBalanceIncreased === false
+                    ? `着金不可 (実測受取 0 ${withdrawalInfo.assetSymbol})`
+                    : '着金不可 (阻害要因あり)'
                   : val?.canWithdrawAfterWait
-                  ? '着金ドライラン合格'
-                  : '要確認'}
+                  ? 'PASS (実測L1着金確認済)'
+                  : val?.recipientBalanceIncreased === false
+                  ? `着金不可 (実測受取 0 ${withdrawalInfo.assetSymbol})`
+                  : '着金不可 (阻害要因あり)'}
               </span>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
@@ -905,6 +931,154 @@ export function PimlicoExecutionPanel({
             )}
           </div>
         </div>
+
+        {val &&
+          (val.portalTopLevelFinalizePassed !== undefined ||
+            (val.cdmHops && val.cdmHops.length > 0)) && (
+            <div className="border border-slate-200 rounded-xl divide-y divide-slate-100 bg-slate-50/40">
+              <div className="px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px] font-semibold text-slate-700">
+                <span>
+                  L1 確定フレーム ＆ 実測受取残高（Multicall3）検査
+                </span>
+                <span className="font-mono text-slate-500">
+                  外枠メソッド: {val.winningFinalizeFrame ?? 'finalizeExternalProof'}
+                </span>
+              </div>
+              <div
+                className={`px-3.5 py-2.5 text-[11px] space-y-1 ${
+                  val.recipientBalanceIncreased === false ||
+                  val.outerPortalRelaySimulated === false
+                    ? 'bg-red-50/60'
+                    : 'bg-emerald-50/30'
+                }`}
+              >
+                <div className="font-mono flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <span className="text-slate-700 font-semibold">1. Portal外枠Tx:</span>
+                  <span
+                    className={
+                      val.portalTopLevelFinalizePassed === false
+                        ? 'text-red-700 font-semibold'
+                        : val.outerPortalRelaySimulated === false
+                        ? 'text-amber-800 font-semibold'
+                        : 'text-emerald-700 font-semibold'
+                    }
+                  >
+                    {val.portalTopLevelFinalizePassed === true
+                      ? val.outerPortalRelaySimulated === false
+                        ? '非Revert (SafeCallが内部失敗を吸収)'
+                        : 'PASS (Revertなし)'
+                      : val.portalTopLevelFinalizePassed === false
+                      ? 'Revert'
+                      : '照会済'}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-slate-700 font-semibold">2. Hop 1 中継:</span>
+                  <span
+                    className={
+                      val.outerPortalRelaySimulated === false
+                        ? 'text-red-700 font-bold'
+                        : 'text-emerald-700 font-semibold'
+                    }
+                  >
+                    {val.outerPortalRelaySimulated === false
+                      ? 'Revert (ここで処理停止)'
+                      : val.outerPortalRelaySimulated === true
+                      ? 'PASS'
+                      : '—'}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-slate-700 font-semibold">3. リーフ着金:</span>
+                  <span
+                    className={
+                      val.outerPortalRelaySimulated === false
+                        ? 'text-slate-500 font-medium'
+                        : val.leafBridgeCallPassed !== false
+                        ? 'text-emerald-700 font-semibold'
+                        : 'text-red-700 font-semibold'
+                    }
+                  >
+                    {val.outerPortalRelaySimulated === false
+                      ? '未到達 (Hop 1停止のため実行されず)'
+                      : val.leafBridgeCallPassed === true
+                      ? 'PASS'
+                      : val.leafBridgeCallPassed === false
+                      ? 'Revert'
+                      : '—'}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-slate-900 font-semibold">実測L1着金額:</span>
+                  <span
+                    className={
+                      val.recipientBalanceIncreased === false
+                        ? 'text-red-700 font-bold'
+                        : 'text-emerald-700 font-bold'
+                    }
+                  >
+                    {val.recipientBalanceIncreased === false
+                      ? `0 ${withdrawalInfo.assetSymbol}（着金しません）`
+                      : val.recipientBalanceIncreased === true
+                      ? `+${withdrawalInfo.amountFormatted} ${withdrawalInfo.assetSymbol}（着金確認済 ✓）`
+                      : '—'}
+                  </span>
+                </div>
+                {val.recipientBalanceIncreased === false && (
+                  <p className="text-[11px] text-red-800 leading-relaxed">
+                    ※ 外枠の finalizeWithdrawalTransactionExternalProof は SafeCall により Revert しませんが、Hop 1 で停止するため L1 受取アドレスの残高は 1 枚も増えません（L1ガス代のみ消費されるため確定実行は行わないでください）。
+                  </p>
+                )}
+              </div>
+              {val.cdmHops?.map((hop) => {
+                const nonceCounter = BigInt(hop.nonce) & ((1n << 240n) - 1n);
+                const blockedByEarlierHop =
+                  hop.hopIndex > 1 && val.outerPortalRelaySimulated === false;
+                return (
+                  <div
+                    key={`${hop.hopIndex}-${hop.versionedHash}`}
+                    className="px-3.5 py-2.5 space-y-1 text-[11px]"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-semibold text-slate-900">
+                        Hop {hop.hopIndex} · CDM nonce #{nonceCounter.toString()}
+                      </span>
+                      <span
+                        className={`font-mono font-semibold ${
+                          hop.standaloneRelayPassed === false
+                            ? 'text-red-700'
+                            : blockedByEarlierHop
+                            ? 'text-slate-500'
+                            : hop.standaloneRelayPassed === true
+                            ? 'text-emerald-700'
+                            : 'text-slate-600'
+                        }`}
+                      >
+                        {hop.standaloneRelayPassed === false
+                          ? 'Revert（本番実行時はここで停止）'
+                          : blockedByEarlierHop
+                          ? '単体テスト時はPASS（本番ではHop 1停止のため未到達）'
+                          : hop.standaloneRelayPassed === true
+                          ? 'フレーム実行: PASS'
+                          : 'オンチェーン状態照会済'}
+                      </span>
+                    </div>
+                    <div className="font-mono text-slate-600 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span>sender: {shortenHex(hop.sender, 8, 6)}</span>
+                      <span aria-hidden="true">→</span>
+                      <span>target: {shortenHex(hop.target, 8, 6)}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>successfulMessages: {String(hop.successfulMessage ?? '—')}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>failedMessages: {String(hop.failedMessage ?? '—')}</span>
+                    </div>
+                    {hop.standaloneRelayError && (
+                      <div className="font-mono text-red-700 break-words">
+                        Revert理由: {hop.standaloneRelayError}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
       </div>
 
       {/* Section 3: L1 Execution & Prominent 「資金を受け取る」 Button */}
@@ -1131,6 +1305,14 @@ export function PimlicoExecutionPanel({
                     {withdrawalInfo.assetSymbol})
                   </span>
                 </>
+              ) : isZeroPayoutBlocked ? (
+                <>
+                  <AlertTriangle className="w-4 h-4" />
+                  <span>
+                    受取不可・実行停止中 (実測着金 0{' '}
+                    {withdrawalInfo.assetSymbol})
+                  </span>
+                </>
               ) : (
                 <>
                   <Coins className="w-4 h-4" />
@@ -1161,8 +1343,16 @@ export function PimlicoExecutionPanel({
         </div>
 
         {!withdrawalInfo.portalFinalized && !canFinalizeNow && (
-          <p className="text-xs text-slate-600 leading-relaxed">
-            {canProveNow
+          <p
+            className={`text-xs leading-relaxed ${
+              isZeroPayoutBlocked
+                ? 'text-red-800 bg-red-50 border border-red-200 rounded-lg px-3.5 py-2.5'
+                : 'text-slate-600'
+            }`}
+          >
+            {isZeroPayoutBlocked
+              ? `【対処方法】このトランザクションは放置して構いません（Base側で ${withdrawalInfo.assetSymbol} は1枚も引き落とされていません。L1でFinalizeするとガス代だけ損するためボタンを安全停止しています）。実際に残高が入っているウォレットから公式ブリッジ（L2StandardBridge）経由で新しく出金を実行してください。`
+              : canProveNow
               ? '現在「1. 出金証明を提出 (proveWithdrawalTransaction)」を実行できます。Prove提出後、ゲーム待機期間（TEE+ZK両方: 1日 / 単一証明: 5日）と成熟期間（1日）が経過すると「資金を受け取る」ボタンが有効になります。'
               : withdrawalInfo.status === 'waiting-to-prove'
               ? '現在 L1 DisputeGame 提案待ちです（通常 約25〜30分で提案され、Prove提出が可能になります）。'

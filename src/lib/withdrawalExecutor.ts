@@ -474,15 +474,38 @@ export async function prepareWithdrawalActionCall(
     );
   }
 
-  const callData = encodeFunctionData({
+  const minSafePortalGas = (primary.gasLimit * 66n) / 63n + 220000n;
+
+  // Select non-reverting L1 Finalize frame via preflight simulation before signing
+  let callData: Hex = encodeFunctionData({
     abi: OPTIMISM_PORTAL_READ_ABI,
     functionName: 'finalizeWithdrawalTransactionExternalProof',
     args: [withdrawalTupleArg, validSubmitter],
   });
+  let selectedFnName = 'finalizeWithdrawalTransactionExternalProof';
+  let estGas: bigint | null = null;
 
-  const estGas = resolveGameAddress
-    ? 260000n
-    : await l1Client
+  if (resolveGameAddress) {
+    // Verify DisputeGame.resolve() passes right now without reverting
+    await l1Client.simulateContract({
+      address: resolveGameAddress,
+      abi: DISPUTE_GAME_ABI,
+      functionName: 'resolve',
+      account: receipt.from,
+    });
+    estGas = minSafePortalGas;
+  } else {
+    // Try finalizeWithdrawalTransactionExternalProof first (works for any caller), fallback to finalizeWithdrawalTransaction if caller == validSubmitter
+    try {
+      await l1Client.simulateContract({
+        address: portalAddress,
+        abi: OPTIMISM_PORTAL_READ_ABI,
+        functionName: 'finalizeWithdrawalTransactionExternalProof',
+        args: [withdrawalTupleArg, validSubmitter],
+        account: receipt.from,
+        gas: minSafePortalGas,
+      });
+      const rawEst = await l1Client
         .estimateContractGas({
           address: portalAddress,
           abi: OPTIMISM_PORTAL_READ_ABI,
@@ -490,7 +513,34 @@ export async function prepareWithdrawalActionCall(
           args: [withdrawalTupleArg, validSubmitter],
           account: receipt.from,
         })
-        .catch(() => null);
+        .catch(() => minSafePortalGas);
+      estGas =
+        (rawEst * 130n) / 100n > minSafePortalGas
+          ? (rawEst * 130n) / 100n
+          : minSafePortalGas;
+    } catch (extErr) {
+      const directData = encodeFunctionData({
+        abi: OPTIMISM_PORTAL_READ_ABI,
+        functionName: 'finalizeWithdrawalTransaction',
+        args: [withdrawalTupleArg],
+      });
+      await l1Client
+        .simulateContract({
+          address: portalAddress,
+          abi: OPTIMISM_PORTAL_READ_ABI,
+          functionName: 'finalizeWithdrawalTransaction',
+          args: [withdrawalTupleArg],
+          account: validSubmitter,
+          gas: minSafePortalGas,
+        })
+        .catch(() => {
+          throw extErr;
+        });
+      callData = directData;
+      selectedFnName = 'finalizeWithdrawalTransaction';
+      estGas = minSafePortalGas;
+    }
+  }
 
   return {
     action: 'finalize',
@@ -500,7 +550,7 @@ export async function prepareWithdrawalActionCall(
     l1ChainName: l1Chain.name,
     withdrawalHash: primary.withdrawalHash,
     callData,
-    functionName: 'finalizeWithdrawalTransactionExternalProof',
+    functionName: selectedFnName,
     disputeGameIndex: null,
     proofSubmitterUsed: validSubmitter,
     estimatedGas: estGas,
@@ -520,7 +570,7 @@ export async function executeWithdrawalOnL1(params: {
   onStep?.(
     action === 'prove'
       ? 'L2 Merkle証明および L1 DisputeGame ルート証明を構築中...'
-      : 'L1 OptimismPortal2 の checkWithdrawal 条件と資金受け取り引数を検証中...'
+      : '非Revert確定フレームをオンチェーン事前検証し最適な実行フレームを選択中...'
   );
 
   const prepared = await prepareWithdrawalActionCall(
@@ -560,7 +610,23 @@ export async function executeWithdrawalOnL1(params: {
         hash: resolveHash,
         timeout: 180_000,
       });
-      onStep?.('DisputeGame解決完了 · 続けて finalizeWithdrawalTransaction を送信中...');
+      onStep?.('DisputeGame解決完了 · 続けて非Revert確定フレームを事前検証し送信中...');
+
+      // Re-verify finalize frame on-chain right after resolve() lands so it cannot revert!
+      await l1Client.call({
+        account,
+        to: prepared.portalAddress,
+        data: prepared.callData,
+        gas: prepared.estimatedGas ?? undefined,
+      });
+    } else {
+      // Preflight eth_call with the connected wallet account right before signing so we never broadcast a reverting tx
+      await l1Client.call({
+        account,
+        to: prepared.portalAddress,
+        data: prepared.callData,
+        gas: prepared.estimatedGas ?? undefined,
+      });
     }
 
     const l1TxHash = await walletClient.sendTransaction({
@@ -569,6 +635,7 @@ export async function executeWithdrawalOnL1(params: {
       to: prepared.portalAddress,
       data: prepared.callData,
       value: 0n,
+      gas: prepared.estimatedGas ?? undefined,
     });
 
     onStep?.(

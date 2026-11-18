@@ -34,12 +34,14 @@ interface WithdrawalSimulatorSectionProps {
   networkConfig: NetworkConfig;
   verifiedWithdrawals: VerifiedTransactionResult[];
   initialTxHash?: string | null;
+  onValidWithdrawalAnalyzed?: (txHash: string, info: WithdrawalInfo) => void;
 }
 
 export function WithdrawalSimulatorSection({
   networkConfig,
   verifiedWithdrawals,
   initialTxHash,
+  onValidWithdrawalAnalyzed,
 }: WithdrawalSimulatorSectionProps) {
   const [txHashInput, setTxHashInput] = useState(initialTxHash ?? '');
   const [isAnalyzingTx, setIsAnalyzingTx] = useState(false);
@@ -152,6 +154,7 @@ export function WithdrawalSimulatorSection({
           return;
         }
         setWithdrawalInfo(info);
+        onValidWithdrawalAnalyzed?.(cleaned, info);
 
         const sim = await simulateWithdrawalOnL1(cleaned as Hex, networkConfig);
         setSimResult(sim);
@@ -165,7 +168,7 @@ export function WithdrawalSimulatorSection({
         setIsAnalyzingTx(false);
       }
     },
-    [networkConfig]
+    [networkConfig, onValidWithdrawalAnalyzed]
   );
 
   useEffect(() => {
@@ -447,14 +450,32 @@ export function WithdrawalSimulatorSection({
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                   <Coins className="w-3.5 h-3.5" />
-                  <span>受取予定金額・アセット</span>
+                  <span>実測L1受取見込・アセット</span>
                 </div>
-                <div className="mt-1.5 text-xl font-bold font-mono tabular-nums text-slate-900">
-                  {withdrawalInfo.amountFormatted} {withdrawalInfo.assetSymbol}
-                </div>
-                <div className="mt-1 text-xs text-slate-500 font-mono truncate">
-                  L1受取: {shortenHex(withdrawalInfo.l1Recipient, 8, 6)}
-                </div>
+                {!withdrawalInfo.portalFinalized &&
+                (withdrawalInfo.validation?.canWithdrawAfterWait === false ||
+                  withdrawalInfo.validation?.recipientBalanceIncreased ===
+                    false) ? (
+                  <>
+                    <div className="mt-1.5 text-xl font-bold font-mono tabular-nums text-red-700">
+                      0 {withdrawalInfo.assetSymbol}（着金不可）
+                    </div>
+                    <div className="mt-1 text-xs text-red-700 font-mono truncate">
+                      データ記載値: {withdrawalInfo.amountFormatted}{' '}
+                      {withdrawalInfo.assetSymbol}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="mt-1.5 text-xl font-bold font-mono tabular-nums text-slate-900">
+                      {withdrawalInfo.amountFormatted}{' '}
+                      {withdrawalInfo.assetSymbol}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500 font-mono truncate">
+                      L1受取: {shortenHex(withdrawalInfo.l1Recipient, 8, 6)}
+                    </div>
+                  </>
+                )}
               </div>
 
               <div className="p-4">
@@ -462,25 +483,43 @@ export function WithdrawalSimulatorSection({
                   <Clock className="w-3.5 h-3.5" />
                   <span>資金受け取りまで残り</span>
                 </div>
-                <div
-                  className={`mt-1.5 text-xl font-bold font-mono tabular-nums ${
-                    liveRemainingSeconds === 0
-                      ? 'text-emerald-700'
-                      : 'text-amber-700'
-                  }`}
-                >
-                  {formatSecondsJapanese(liveRemainingSeconds)}
-                </div>
-                <div className="mt-1 text-xs text-slate-500 font-mono tabular-nums">
-                  {withdrawalInfo.estimatedClaimableAtMs &&
-                  liveRemainingSeconds !== 0
-                    ? `予定: ${formatUnixTimestamp(
-                        Math.floor(withdrawalInfo.estimatedClaimableAtMs / 1000)
-                      )}`
-                    : withdrawalInfo.portalFinalized
-                    ? 'L1 資金受取完了済'
-                    : '今すぐ資金受け取り可能'}
-                </div>
+                {!withdrawalInfo.portalFinalized &&
+                (withdrawalInfo.validation?.canWithdrawAfterWait === false ||
+                  withdrawalInfo.validation?.recipientBalanceIncreased ===
+                    false) ? (
+                  <>
+                    <div className="mt-1.5 text-lg font-bold text-red-700">
+                      受取不可（Finalize不要）
+                    </div>
+                    <div className="mt-1 text-xs text-red-700">
+                      待機完了後もL1残高は増えません
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div
+                      className={`mt-1.5 text-xl font-bold font-mono tabular-nums ${
+                        liveRemainingSeconds === 0
+                          ? 'text-emerald-700'
+                          : 'text-amber-700'
+                      }`}
+                    >
+                      {formatSecondsJapanese(liveRemainingSeconds)}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500 font-mono tabular-nums">
+                      {withdrawalInfo.estimatedClaimableAtMs &&
+                      liveRemainingSeconds !== 0
+                        ? `予定: ${formatUnixTimestamp(
+                            Math.floor(
+                              withdrawalInfo.estimatedClaimableAtMs / 1000
+                            )
+                          )}`
+                        : withdrawalInfo.portalFinalized
+                        ? 'L1 資金受取完了済'
+                        : '今すぐ資金受け取り可能'}
+                    </div>
+                  </>
+                )}
               </div>
 
               <div className="p-4">
@@ -548,7 +587,10 @@ export function WithdrawalSimulatorSection({
               onRunExternalSimulation={() =>
                 runTxAnalysisAndSimulation(txHashInput)
               }
-              onWithdrawalUpdated={(updated) => setWithdrawalInfo(updated)}
+              onWithdrawalUpdated={(updated) => {
+                setWithdrawalInfo(updated);
+                onValidWithdrawalAnalyzed?.(txHashInput.trim(), updated);
+              }}
               onExecutionCompleted={() =>
                 runTxAnalysisAndSimulation(txHashInput)
               }

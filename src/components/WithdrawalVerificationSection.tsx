@@ -19,7 +19,6 @@ import {
 } from 'lucide-react';
 import {
   ChainHeadSnapshot,
-  FinalityStage,
   NetworkConfig,
   ParsedHashBatch,
   ReliabilityTier,
@@ -29,14 +28,15 @@ import {
   exportResultsAsCsv,
   exportResultsAsJson,
   formatUnixTimestamp,
-  getFinalityLabel,
   shortenHex,
 } from '../lib/exportUtils';
+import { isPartiallyFetchedOrBrokenResult } from '../lib/finalizedCache';
 import {
   formatSecondsJapanese,
   getWithdrawalProveDisplayMeta,
   getWithdrawalStatusLabel,
 } from '../lib/withdrawalAnalyzer';
+import { WithdrawalAddressCheckPanel } from './WithdrawalAddressCheckPanel';
 
 type WithdrawalFilter =
   | 'all'
@@ -154,14 +154,7 @@ export function WithdrawalVerificationSection({
   }, [hasActiveCountdown]);
 
   const retryableHashes = useMemo(
-    () =>
-      results
-        .filter(
-          (r) =>
-            r.finality === FinalityStage.RPC_ERROR ||
-            r.finality === FinalityStage.NOT_FOUND
-        )
-        .map((r) => r.hash),
+    () => results.filter(isPartiallyFetchedOrBrokenResult).map((r) => r.hash),
     [results]
   );
 
@@ -173,7 +166,9 @@ export function WithdrawalVerificationSection({
     let otherOrError = 0;
 
     for (const r of results) {
-      if (r.withdrawal) {
+      if (isPartiallyFetchedOrBrokenResult(r) || !r.withdrawal) {
+        otherOrError += 1;
+      } else {
         const meta = getWithdrawalProveDisplayMeta(r.withdrawal);
         if (meta.stateKind === 'finalized') {
           claimed += 1;
@@ -184,8 +179,6 @@ export function WithdrawalVerificationSection({
         } else {
           unproven += 1;
         }
-      } else {
-        otherOrError += 1;
       }
     }
 
@@ -203,26 +196,34 @@ export function WithdrawalVerificationSection({
     const q = searchQuery.trim().toLowerCase();
     return results.filter((r) => {
       if (filterMode === 'claimed') {
-        if (!r.withdrawal) return false;
+        if (!r.withdrawal || isPartiallyFetchedOrBrokenResult(r)) return false;
         if (getWithdrawalProveDisplayMeta(r.withdrawal).stateKind !== 'finalized') {
           return false;
         }
       } else if (filterMode === 'ready') {
-        if (!r.withdrawal || r.withdrawal.status !== 'ready-to-finalize') {
+        if (
+          !r.withdrawal ||
+          isPartiallyFetchedOrBrokenResult(r) ||
+          r.withdrawal.status !== 'ready-to-finalize'
+        ) {
           return false;
         }
       } else if (filterMode === 'proven_waiting') {
-        if (!r.withdrawal) return false;
+        if (!r.withdrawal || isPartiallyFetchedOrBrokenResult(r)) return false;
         const meta = getWithdrawalProveDisplayMeta(r.withdrawal);
-        if (!meta.isProven || meta.stateKind === 'finalized' || r.withdrawal.status === 'ready-to-finalize') {
+        if (
+          !meta.isProven ||
+          meta.stateKind === 'finalized' ||
+          r.withdrawal.status === 'ready-to-finalize'
+        ) {
           return false;
         }
       } else if (filterMode === 'unproven') {
-        if (!r.withdrawal) return false;
+        if (!r.withdrawal || isPartiallyFetchedOrBrokenResult(r)) return false;
         const meta = getWithdrawalProveDisplayMeta(r.withdrawal);
         if (meta.isProven) return false;
       } else if (filterMode === 'other_or_error') {
-        if (r.withdrawal !== null) return false;
+        if (!isPartiallyFetchedOrBrokenResult(r) && r.withdrawal !== null) return false;
       }
 
       if (!q) return true;
@@ -472,7 +473,7 @@ export function WithdrawalVerificationSection({
               <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-slate-900">
                 {counts.total.toLocaleString()}
                 <span className="text-xs font-sans font-normal text-slate-500 ml-1">
-                  件{counts.otherOrError > 0 ? ` (非出金/Err: ${counts.otherOrError})` : ''}
+                  件{counts.otherOrError > 0 ? ` (未取得/非出金: ${counts.otherOrError})` : ''}
                 </span>
               </div>
             </div>
@@ -514,23 +515,14 @@ export function WithdrawalVerificationSection({
             <div className="flex flex-wrap items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />
               <span className="font-semibold text-slate-900">情報の信頼性・照合ソース:</span>
-              <span>
-                L2 ({snapshot?.isServerProxy ? 'Server Archive Proxy' : 'JSON-RPC'})
-              </span>
-              <span aria-hidden="true">·</span>
-              <span>
-                L1 (
-                {snapshot?.l1Head?.finalizedNumber !== null &&
-                snapshot?.l1Head?.finalizedNumber !== undefined
-                  ? 'Ethereum Mainnet OptimismPortal2 直接照合済'
-                  : 'L1未接続'}
-                )
+              <span className="font-mono text-slate-700">
+                L2ToL1MessagePasser · L1 OptimismPortal2 · AggregateVerifier (TEE/ZK) 直接照合
               </span>
               <span aria-hidden="true">·</span>
               <span>外部インデクサー不使用</span>
             </div>
-            <span className="font-mono text-slate-500">
-              L2確定状態とは独立して finalizedWithdrawals(hash) を確認
+            <span className="text-slate-500">
+              出金に無関係なL2ヘッド判定を除外し、OP Stack実コントラクト4要件のみを検証
             </span>
           </div>
 
@@ -603,7 +595,7 @@ export function WithdrawalVerificationSection({
                         : 'text-slate-600 hover:text-slate-900'
                     }`}
                   >
-                    非出金 / エラー ({counts.otherOrError})
+                    未取得 / 非出金 ({counts.otherOrError})
                   </button>
                 )}
               </div>
@@ -614,15 +606,15 @@ export function WithdrawalVerificationSection({
                     type="button"
                     onClick={() => onRetryErrors(retryableHashes)}
                     disabled={isRetryingErrors || isVerifying}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
                   >
                     <RefreshCw
                       className={`w-3.5 h-3.5 ${isRetryingErrors ? 'animate-spin' : ''}`}
                     />
                     <span>
                       {isRetryingErrors
-                        ? '再実行中...'
-                        : `エラー/未検出のみ再実行 (${retryableHashes.length}件)`}
+                        ? '未取得項目を再取得中...'
+                        : `未取得・部分照合のみ再取得 (${retryableHashes.length}件)`}
                     </span>
                   </button>
                 )}
@@ -670,7 +662,6 @@ export function WithdrawalVerificationSection({
                     <th className="py-2.5 px-3">待機後の実出金検証</th>
                     <th className="py-2.5 px-3 text-right">出金額</th>
                     <th className="py-2.5 px-3 text-right">出金可能残り時間</th>
-                    <th className="py-2.5 px-3">L2確定</th>
                     <th className="py-2.5 px-3">情報の信頼性</th>
                     <th className="py-2.5 pl-2 pr-4 text-right">L1実行 / 詳細</th>
                   </tr>
@@ -678,7 +669,7 @@ export function WithdrawalVerificationSection({
                 <tbody className="divide-y divide-slate-100 text-xs">
                   {filteredResults.length === 0 ? (
                     <tr>
-                      <td colSpan={9} className="py-10 text-center text-sm text-slate-500">
+                      <td colSpan={8} className="py-10 text-center text-sm text-slate-500">
                         該当する出金トランザクションはありません
                       </td>
                     </tr>
@@ -797,10 +788,10 @@ export function WithdrawalVerificationSection({
                                     : ''}
                                 </div>
                               </div>
-                            ) : row.errorReason ? (
-                              <span className="text-red-700 font-medium inline-flex items-center gap-1">
+                            ) : isPartiallyFetchedOrBrokenResult(row) ? (
+                              <span className="text-amber-700 font-medium inline-flex items-center gap-1">
                                 <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                                <span>エラー/未検出</span>
+                                <span>L1状態 未取得 (要再取得)</span>
                               </span>
                             ) : (
                               <span className="text-slate-500">出金イベントなし</span>
@@ -818,7 +809,7 @@ export function WithdrawalVerificationSection({
                                   <div title={val.verdictSummary}>
                                     <span className="inline-flex items-center gap-1 text-emerald-700 font-semibold">
                                       <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                                      <span>実出金可 (ドライラン合格)</span>
+                                      <span>実測L1着金 PASS</span>
                                     </span>
                                     <div className="text-[10px] font-mono text-slate-500">
                                       MP={val.messagePasser.sentMessageRecorded ? 'true' : 'false'} ·{' '}
@@ -831,11 +822,15 @@ export function WithdrawalVerificationSection({
                                     title={val.verdictSummary}
                                   >
                                     <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                                    <span>要確認 (阻害要因あり)</span>
+                                    <span>
+                                      {val.recipientBalanceIncreased === false
+                                        ? `着金不可 (実測受取 0 ${w.assetSymbol})`
+                                        : '着金不可 (阻害要因あり)'}
+                                    </span>
                                   </span>
                                 )
                               ) : (
-                                <span className="text-slate-500">詳細で確認</span>
+                                <span className="text-amber-700 font-medium">L1未取得</span>
                               )
                             ) : (
                               <span className="text-slate-400">—</span>
@@ -871,9 +866,6 @@ export function WithdrawalVerificationSection({
                             ) : (
                               <span className="text-slate-400">—</span>
                             )}
-                          </td>
-                          <td className="py-2 px-3 whitespace-nowrap text-slate-600">
-                            {getFinalityLabel(row.finality)}
                           </td>
                           <td className="py-2 px-3 whitespace-nowrap">
                             {renderReliabilityText(row)}
@@ -921,6 +913,9 @@ export function WithdrawalVerificationSection({
           </div>
         </div>
       )}
+
+      {/* On-chain Withdrawal Recipient / Sender Batch Address Audit */}
+      <WithdrawalAddressCheckPanel networkConfig={networkConfig} />
     </div>
   );
 }

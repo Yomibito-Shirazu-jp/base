@@ -3,10 +3,10 @@ export function FinalityGuideSection() {
     <section className="space-y-6 max-w-4xl">
       <div className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8">
         <h2 className="text-xl font-bold text-slate-900">
-          Base (OP Stack) オンチェーン・ファイナライズ検証の仕組み
+          Base (OP Stack) オンチェーン検証アーキテクチャ
         </h2>
         <p className="mt-3 text-sm text-slate-600 leading-relaxed">
-          本ツールは外部のエクスプローラーAPIや中央集権型インデクサーに依存せず、Base L2ノード（op-geth / op-node）および Ethereum L1 ノードの標準 JSON-RPC をブラウザから直接バッチ呼び出しして、トランザクションの確定性を検証します。
+          Base では、通常のL2トランザクション確定（Casper FFG バッチ確定）と、Ethereum L1 で資産を引き出すブリッジ出金検証（OptimismPortal2）はスマートコントラクト上まったく独立した仕組みで動作します。本ツールはそれぞれの実システムと同一のオンチェーン条件のみを直接照会します。
         </p>
 
         <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -16,7 +16,7 @@ export function FinalityGuideSection() {
             <p className="mt-2 text-xs text-slate-600 leading-relaxed">
               <span className="font-mono text-slate-800">eth_getBlockByNumber("latest")</span>{' '}
               以下かつ <span className="font-mono text-slate-800">safe</span>{' '}
-              より新しいブロック。約2秒で生成されますが、L1へのバッチ投稿前のため理論上のリオーグ余地があります。
+              より新しいブロック。約2秒で生成されますが、L1へのバッチ投稿前の段階です。
             </p>
           </div>
 
@@ -34,7 +34,7 @@ export function FinalityGuideSection() {
             <h3 className="mt-1 text-sm font-bold text-slate-900">Ethereum L1 コンセンサス確定</h3>
             <p className="mt-2 text-xs text-slate-600 leading-relaxed">
               <span className="font-mono text-slate-800">eth_getBlockByNumber("finalized")</span>{' '}
-              以下のブロック。バッチを格納したL1ブロックがCasper FFGにより確定（約13〜15分）し、不可逆となります。
+              以下のブロック。バッチを格納したL1ブロックがCasper FFGにより確定（約13〜15分）し、通常の送金・スワップは不可逆となります。
             </p>
           </div>
         </div>
@@ -42,44 +42,53 @@ export function FinalityGuideSection() {
 
       <div className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-4">
         <h3 className="text-base font-bold text-slate-900">
-          使用しているオンチェーン JSON-RPC メソッドとコントラクト
+          L2 → L1 出金検証（OptimismPortal2.sol &amp; AggregateVerifier）の実コントラクト4要件
         </h3>
+        <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
+          出金検証では L2 の Safe / Finalized ヘッドや L1Block Predeploy などの無関係な項目は一切使用せず、実際に L1 で資産を引き出すコントラクト実装（<span className="font-mono text-slate-800">OptimismPortal2</span>）と完全に同一の4要件のみを検証します。
+        </p>
         <dl className="divide-y divide-slate-100 text-xs sm:text-sm">
           <div className="py-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
-            <dt className="font-mono font-medium text-slate-900">eth_getBlockByNumber</dt>
+            <dt className="font-mono font-medium text-slate-900">
+              1. L2ToL1MessagePasser (0x4200...0016)
+            </dt>
             <dd className="sm:col-span-2 text-slate-600">
-              <span className="font-mono text-slate-800">"finalized"</span> /{' '}
-              <span className="font-mono text-slate-800">"safe"</span> /{' '}
-              <span className="font-mono text-slate-800">"latest"</span>{' '}
-              タグをバッチ取得し、各トランザクションの収録ブロック番号と比較してファイナリティ段階を算出します。
+              <span className="font-mono text-slate-800">sentMessages[withdrawalHash] == true</span>{' '}
+              の記録および <span className="font-mono text-slate-800">eth_getProof</span>{' '}
+              によるストレージスロット（<span className="font-mono text-slate-800">keccak256(abi.encode(hash, 0)) == 1</span>）の Merkle Patricia Trie 証明を検証します。
             </dd>
           </div>
           <div className="py-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
             <dt className="font-mono font-medium text-slate-900">
-              eth_getTransactionReceipt
+              2. OptimismPortal2 ガード要件
             </dt>
             <dd className="sm:col-span-2 text-slate-600">
-              EVMの実行成否（<span className="font-mono text-slate-800">status: 0x1 / 0x0</span>）およびOP Stack固有の{' '}
-              <span className="font-mono text-slate-800">l1Fee</span>（L1データ投稿手数料）を直接読み取ります。
+              <span className="font-mono text-slate-800">!paused()</span>、呼び出し先{' '}
+              <span className="font-mono text-slate-800">target != address(OptimismPortal2)</span>、および二重受け取り防止{' '}
+              <span className="font-mono text-slate-800">finalizedWithdrawals[withdrawalHash] == false</span>{' '}
+              を確認します。
             </dd>
           </div>
           <div className="py-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
             <dt className="font-mono font-medium text-slate-900">
-              L1Block Predeploy (0x4200...0015)
+              3. DisputeGameFactory &amp; AggregateVerifier (TEE / ZK)
             </dt>
             <dd className="sm:col-span-2 text-slate-600">
-              対象L2ブロック時点で参照していたEthereum L1 Originブロック番号（
-              <span className="font-mono text-slate-800">number()</span>）を{' '}
-              <span className="font-mono text-slate-800">eth_call</span>{' '}
-              で読み取り、L1側のFinalizedブロックとも照合します。
+              <span className="font-mono text-slate-800">provenWithdrawals</span> に紐づく{' '}
+              <span className="font-mono text-slate-800">DisputeGameProxy</span> について、
+              <span className="font-mono text-slate-800">!disputeGameBlacklist</span>・
+              <span className="font-mono text-slate-800">wasRespectedGameTypeWhenCreated</span>・ゲーム勝敗ステータス、およびマルチプルーフ証明状態（<strong>単一証明: 5日 = 432,000秒 ／ TEE + ZK 二重証明: 1日 = 86,400秒</strong>）を照合します。
             </dd>
           </div>
           <div className="py-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
-            <dt className="font-medium text-slate-900">出金 (L2 → L1) に関する補足</dt>
+            <dt className="font-mono font-medium text-slate-900">
+              4. checkWithdrawal &amp; Finalize 実行検証
+            </dt>
             <dd className="sm:col-span-2 text-slate-600">
-              通常の入金・スワップ・送金等の確定確認には{' '}
-              <strong className="text-slate-800">Finalized (約13〜15分)</strong>{' '}
-              で十分な不可逆性を持ちます。ただし、ネイティブブリッジ（OptimismPortal2）経由のL2→L1出金をL1側で最終クレームする操作には、別途7日間のFault Proofチャレンジ期間が必要です。
+              Prove 提出からの成熟待機（<span className="font-mono text-slate-800">proofMaturityDelaySeconds = 86,400秒 (1日)</span>）およびゲーム解決後の{' '}
+              <span className="font-mono text-slate-800">OptimismPortal2.checkWithdrawal(withdrawalHash, proofSubmitter)</span>{' '}
+              と <span className="font-mono text-slate-800">finalizeWithdrawalTransactionExternalProof</span>{' '}
+              のオンチェーン通過可否を直接検証します。
             </dd>
           </div>
         </dl>

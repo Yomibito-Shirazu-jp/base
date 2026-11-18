@@ -10,6 +10,7 @@ import {
   Code2,
   ShieldAlert,
   Clock,
+  RefreshCw,
 } from 'lucide-react';
 import type { Hex } from 'viem';
 import {
@@ -27,6 +28,10 @@ import {
   getFinalityLabel,
 } from '../lib/exportUtils';
 import {
+  hasWithdrawalIndicator,
+  isPartiallyFetchedOrBrokenResult,
+} from '../lib/finalizedCache';
+import {
   formatSecondsJapanese,
   getWithdrawalProveDisplayMeta,
   getWithdrawalStatusLabel,
@@ -42,6 +47,9 @@ interface TxInspectorDrawerProps {
   explorerUrl: string;
   l1ExplorerUrl: string;
   onClose: () => void;
+  onRetrySingleHash?: (hash: string) => void;
+  isRetryingSingle?: boolean;
+  onWithdrawalUpdatedGlobal?: (hash: string, updated: WithdrawalInfo) => void;
   onOpenInSimulator?: (txHash: string) => void;
 }
 
@@ -52,6 +60,9 @@ export function TxInspectorDrawer({
   explorerUrl,
   l1ExplorerUrl,
   onClose,
+  onRetrySingleHash,
+  isRetryingSingle = false,
+  onWithdrawalUpdatedGlobal,
   onOpenInSimulator,
 }: TxInspectorDrawerProps) {
   const [showRawJson, setShowRawJson] = useState(false);
@@ -115,6 +126,12 @@ export function TxInspectorDrawer({
   const isFinalized = result.finality === FinalityStage.FINALIZED;
 
   const isValidHexHash = /^0x[0-9a-fA-F]{64}$/.test(result.hash);
+  const activeWithdrawal = localWithdrawal ?? result.withdrawal;
+  const isWithdrawalTx = Boolean(activeWithdrawal || hasWithdrawalIndicator(result));
+  const isPartialOrBroken = isPartiallyFetchedOrBrokenResult({
+    ...result,
+    withdrawal: activeWithdrawal ?? result.withdrawal,
+  });
 
   return (
     <div
@@ -178,13 +195,23 @@ export function TxInspectorDrawer({
           <div className="border border-slate-200 rounded-xl p-4 bg-slate-50/70">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <div className="text-xs text-slate-500">現在のファイナライズ判定</div>
+                <div className="text-xs text-slate-500">
+                  {isWithdrawalTx
+                    ? 'L1 OptimismPortal2 出金監査ステータス'
+                    : '現在のファイナライズ判定'}
+                </div>
                 <div className="mt-1 text-lg font-bold text-slate-900">
-                  {getFinalityLabel(result.finality)}
+                  {isWithdrawalTx
+                    ? activeWithdrawal
+                      ? `${getWithdrawalProveDisplayMeta(activeWithdrawal).shortBadge} · ${getWithdrawalStatusLabel(
+                          activeWithdrawal.status
+                        )}`
+                      : 'L1 OptimismPortal2 状態 未取得'
+                    : getFinalityLabel(result.finality)}
                 </div>
               </div>
               <div className="text-right">
-                <div className="text-xs text-slate-500">EVM 実行ステータス</div>
+                <div className="text-xs text-slate-500">L2 EVM 実行ステータス</div>
                 <div
                   className={`mt-1 text-sm font-semibold ${
                     result.executionStatus === ExecutionStatus.SUCCESS
@@ -208,28 +235,46 @@ export function TxInspectorDrawer({
           {/* Information Reliability & Provenance */}
           {result.reliability && (
             <div className="border border-slate-200 rounded-xl p-4 space-y-2">
-              <div className="flex items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-slate-500">
                   情報の信頼性・照合根拠
                 </span>
-                <span
-                  className={`inline-flex items-center gap-1.5 text-xs font-semibold ${
-                    result.reliability.tier === 'verified_onchain'
-                      ? 'text-emerald-700'
-                      : result.reliability.tier === 'estimated_pending'
-                      ? 'text-sky-700'
-                      : 'text-amber-700'
-                  }`}
-                >
-                  {result.reliability.tier === 'verified_onchain' ? (
-                    <ShieldCheck className="w-4 h-4 shrink-0" />
-                  ) : result.reliability.tier === 'estimated_pending' ? (
-                    <Clock className="w-4 h-4 shrink-0" />
-                  ) : (
-                    <ShieldAlert className="w-4 h-4 shrink-0" />
+                <div className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={`inline-flex items-center gap-1.5 text-xs font-semibold ${
+                      result.reliability.tier === 'verified_onchain'
+                        ? 'text-emerald-700'
+                        : result.reliability.tier === 'estimated_pending'
+                        ? 'text-sky-700'
+                        : 'text-amber-700'
+                    }`}
+                  >
+                    {result.reliability.tier === 'verified_onchain' ? (
+                      <ShieldCheck className="w-4 h-4 shrink-0" />
+                    ) : result.reliability.tier === 'estimated_pending' ? (
+                      <Clock className="w-4 h-4 shrink-0" />
+                    ) : (
+                      <ShieldAlert className="w-4 h-4 shrink-0" />
+                    )}
+                    <span>{result.reliability.label}</span>
+                  </span>
+
+                  {isPartialOrBroken && onRetrySingleHash && isValidHexHash && (
+                    <button
+                      type="button"
+                      onClick={() => onRetrySingleHash(result.hash)}
+                      disabled={isRetryingSingle}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${isRetryingSingle ? 'animate-spin' : ''}`}
+                      />
+                      <span>
+                        {isRetryingSingle ? '再取得中...' : '未取得項目を再取得'}
+                      </span>
+                    </button>
                   )}
-                  <span>{result.reliability.label}</span>
-                </span>
+                </div>
               </div>
               <div className="text-xs text-slate-600 leading-relaxed">
                 <span className="font-medium text-slate-700">照合ソース: </span>
@@ -245,91 +290,93 @@ export function TxInspectorDrawer({
             </div>
           )}
 
-          {/* 3-Stage OP Stack Finality Pipeline */}
-          <div>
-            <h4 className="text-xs font-semibold text-slate-500 mb-3">
-              OP Stack (Base) ファイナライズ進行ステップ
-            </h4>
-            <div className="border border-slate-200 rounded-xl divide-y divide-slate-100">
-              {/* Step 1: Unsafe */}
-              <div className="p-4 flex items-start justify-between gap-4">
-                <div className="flex items-start gap-3">
-                  <Zap
-                    className={`w-4 h-4 mt-0.5 shrink-0 ${
-                      isL2Confirmed ? 'text-emerald-600' : 'text-slate-300'
-                    }`}
-                  />
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900">
-                      1. L2 シーケンサー承認 (Unsafe Head)
+          {/* 3-Stage OP Stack Finality Pipeline (shown strictly for general non-withdrawal L2 transactions) */}
+          {!isWithdrawalTx && (
+            <div>
+              <h4 className="text-xs font-semibold text-slate-500 mb-3">
+                OP Stack (Base) ファイナライズ進行ステップ
+              </h4>
+              <div className="border border-slate-200 rounded-xl divide-y divide-slate-100">
+                {/* Step 1: Unsafe */}
+                <div className="p-4 flex items-start justify-between gap-4">
+                  <div className="flex items-start gap-3">
+                    <Zap
+                      className={`w-4 h-4 mt-0.5 shrink-0 ${
+                        isL2Confirmed ? 'text-emerald-600' : 'text-slate-300'
+                      }`}
+                    />
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900">
+                        1. L2 シーケンサー承認 (Unsafe Head)
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-600">
+                        Base シーケンサーによりブロックへ取り込まれ、状態遷移が確定した段階（約2秒）。
+                      </p>
                     </div>
-                    <p className="mt-0.5 text-xs text-slate-600">
-                      Base シーケンサーによりブロックへ取り込まれ、状態遷移が確定した段階（約2秒）。
-                    </p>
                   </div>
+                  <span className="text-xs font-mono tabular-nums text-slate-600 shrink-0">
+                    {isL2Confirmed && result.blockNumber !== null
+                      ? `通過 (#${result.blockNumber.toLocaleString()})`
+                      : '未確定'}
+                  </span>
                 </div>
-                <span className="text-xs font-mono tabular-nums text-slate-600 shrink-0">
-                  {isL2Confirmed && result.blockNumber !== null
-                    ? `通過 (#${result.blockNumber.toLocaleString()})`
-                    : '未確定'}
-                </span>
-              </div>
 
-              {/* Step 2: Safe */}
-              <div className="p-4 flex items-start justify-between gap-4">
-                <div className="flex items-start gap-3">
-                  <Layers
-                    className={`w-4 h-4 mt-0.5 shrink-0 ${
-                      isSafeOrBetter ? 'text-emerald-600' : 'text-slate-300'
-                    }`}
-                  />
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900">
-                      2. Ethereum L1 バッチ投稿 (Safe Head)
+                {/* Step 2: Safe */}
+                <div className="p-4 flex items-start justify-between gap-4">
+                  <div className="flex items-start gap-3">
+                    <Layers
+                      className={`w-4 h-4 mt-0.5 shrink-0 ${
+                        isSafeOrBetter ? 'text-emerald-600' : 'text-slate-300'
+                      }`}
+                    />
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900">
+                        2. Ethereum L1 バッチ投稿 (Safe Head)
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-600">
+                        該当L2ブロックを含むバッチデータがEthereum L1 (EIP-4844 Blob / Calldata) に記録され、L1から導出可能になった段階。
+                      </p>
                     </div>
-                    <p className="mt-0.5 text-xs text-slate-600">
-                      該当L2ブロックを含むバッチデータがEthereum L1 (EIP-4844 Blob / Calldata) に記録され、L1から導出可能になった段階。
-                    </p>
                   </div>
+                  <span className="text-xs font-mono tabular-nums text-slate-600 shrink-0">
+                    {isSafeOrBetter
+                      ? '通過'
+                      : result.blocksToSafe !== null && result.blocksToSafe > 0
+                      ? `あと ${result.blocksToSafe.toLocaleString()} blk`
+                      : '待機中'}
+                  </span>
                 </div>
-                <span className="text-xs font-mono tabular-nums text-slate-600 shrink-0">
-                  {isSafeOrBetter
-                    ? '通過'
-                    : result.blocksToSafe !== null && result.blocksToSafe > 0
-                    ? `あと ${result.blocksToSafe.toLocaleString()} blk`
-                    : '待機中'}
-                </span>
-              </div>
 
-              {/* Step 3: Finalized */}
-              <div className="p-4 flex items-start justify-between gap-4">
-                <div className="flex items-start gap-3">
-                  <ShieldCheck
-                    className={`w-4 h-4 mt-0.5 shrink-0 ${
-                      isFinalized ? 'text-emerald-600' : 'text-slate-300'
-                    }`}
-                  />
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900">
-                      3. Ethereum L1 コンセンサス確定 (Finalized Head)
+                {/* Step 3: Finalized */}
+                <div className="p-4 flex items-start justify-between gap-4">
+                  <div className="flex items-start gap-3">
+                    <ShieldCheck
+                      className={`w-4 h-4 mt-0.5 shrink-0 ${
+                        isFinalized ? 'text-emerald-600' : 'text-slate-300'
+                      }`}
+                    />
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900">
+                        3. Ethereum L1 コンセンサス確定 (Finalized Head)
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-600">
+                        バッチを格納したL1ブロックがEthereum Casper FFGで確定（約2エポック / 13〜15分）。L1スラッシングなしに巻き戻し不可。
+                      </p>
                     </div>
-                    <p className="mt-0.5 text-xs text-slate-600">
-                      バッチを格納したL1ブロックがEthereum Casper FFGで確定（約2エポック / 13〜15分）。L1スラッシングなしに巻き戻し不可。
-                    </p>
                   </div>
+                  <span className="text-xs font-mono tabular-nums text-slate-600 shrink-0">
+                    {isFinalized
+                      ? '確定済み'
+                      : result.blocksToFinalized !== null && result.blocksToFinalized > 0
+                      ? `あと ${result.blocksToFinalized.toLocaleString()} blk (${formatDurationRough(
+                          result.blocksToFinalized
+                        )})`
+                      : '待機中'}
+                  </span>
                 </div>
-                <span className="text-xs font-mono tabular-nums text-slate-600 shrink-0">
-                  {isFinalized
-                    ? '確定済み'
-                    : result.blocksToFinalized !== null && result.blocksToFinalized > 0
-                    ? `あと ${result.blocksToFinalized.toLocaleString()} blk (${formatDurationRough(
-                        result.blocksToFinalized
-                      )})`
-                    : '待機中'}
-                </span>
               </div>
             </div>
-          </div>
+          )}
 
           {/* L2 -> L1 Withdrawal Detail, TEE/ZK Check, 2-Step Simulation & Receive Funds */}
           {(localWithdrawal ?? result.withdrawal) && (() => {
@@ -480,6 +527,184 @@ export function TxInspectorDrawer({
                     </div>
                   )}
 
+                  {/* 3-Stage Frame & CrossDomainMessenger Hop Breakdown */}
+                  {val &&
+                    (val.portalTopLevelFinalizePassed !== undefined ||
+                      (val.cdmHops && val.cdmHops.length > 0)) && (
+                      <div className="border border-slate-200 rounded-xl divide-y divide-slate-100">
+                        <div className="px-3.5 py-2 bg-slate-50/80 flex flex-wrap items-center justify-between gap-2 text-[11px] font-semibold text-slate-700">
+                          <span>
+                            L1 確定フレーム ＆ 実測受取残高（Multicall3）検査
+                          </span>
+                          <span className="font-mono text-slate-500">
+                            外枠メソッド:{' '}
+                            {val.winningFinalizeFrame ?? 'finalizeExternalProof'}
+                          </span>
+                        </div>
+
+                        <div
+                          className={`px-3.5 py-2.5 space-y-1 text-[11px] ${
+                            val.recipientBalanceIncreased === false ||
+                            val.outerPortalRelaySimulated === false
+                              ? 'bg-red-50/60'
+                              : 'bg-emerald-50/30'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono">
+                            <span className="font-semibold text-slate-900">
+                              1. Portal外枠Tx:
+                            </span>
+                            <span
+                              className={
+                                val.portalTopLevelFinalizePassed === false
+                                  ? 'text-red-700 font-semibold'
+                                  : val.outerPortalRelaySimulated === false
+                                  ? 'text-amber-800 font-semibold'
+                                  : 'text-emerald-700 font-semibold'
+                              }
+                            >
+                              {val.portalTopLevelFinalizePassed === true
+                                ? val.outerPortalRelaySimulated === false
+                                  ? '非Revert (SafeCall吸収)'
+                                  : 'PASS (Revertなし)'
+                                : val.portalTopLevelFinalizePassed === false
+                                ? 'Revert'
+                                : '照会済'}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-semibold text-slate-900">
+                              2. Hop 1 中継:
+                            </span>
+                            <span
+                              className={
+                                val.outerPortalRelaySimulated === false
+                                  ? 'text-red-700 font-bold'
+                                  : 'text-emerald-700 font-semibold'
+                              }
+                            >
+                              {val.outerPortalRelaySimulated === false
+                                ? 'Revert (ここで停止)'
+                                : val.outerPortalRelaySimulated === true
+                                ? 'PASS'
+                                : '—'}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-semibold text-slate-900">
+                              3. リーフ着金:
+                            </span>
+                            <span
+                              className={
+                                val.outerPortalRelaySimulated === false
+                                  ? 'text-slate-500 font-medium'
+                                  : val.leafBridgeCallPassed !== false
+                                  ? 'text-emerald-700 font-semibold'
+                                  : 'text-red-700 font-semibold'
+                              }
+                            >
+                              {val.outerPortalRelaySimulated === false
+                                ? '未到達'
+                                : val.leafBridgeCallPassed === true
+                                ? 'PASS'
+                                : val.leafBridgeCallPassed === false
+                                ? 'Revert'
+                                : '—'}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-semibold text-slate-900">
+                              実測L1着金額:
+                            </span>
+                            <span
+                              className={
+                                val.recipientBalanceIncreased === false
+                                  ? 'text-red-700 font-bold'
+                                  : 'text-emerald-700 font-bold'
+                              }
+                            >
+                              {val.recipientBalanceIncreased === false
+                                ? `0 ${w.assetSymbol}（着金なし）`
+                                : val.recipientBalanceIncreased === true
+                                ? `+${w.amountFormatted} ${w.assetSymbol}（着金確認済 ✓）`
+                                : '—'}
+                            </span>
+                          </div>
+                          {val.recipientBalanceIncreased === false && (
+                            <p className="text-[11px] text-red-800 leading-relaxed">
+                              ※ OptimismPortal2 外側確定Tx (1) は SafeCall により Revert しませんが、Hop 1 (2) が L1CDM 自身を target としているため停止し、L1 受取アドレスの残高増分は 0 です（資産は着金しません）。
+                            </p>
+                          )}
+                        </div>
+
+                        {val.cdmHops?.map((hop) => {
+                          const nonceBig = BigInt(hop.nonce);
+                          const nonceCounter = nonceBig & ((1n << 240n) - 1n);
+                          const blockedByEarlierHop =
+                            hop.hopIndex > 1 &&
+                            val.outerPortalRelaySimulated === false;
+                          return (
+                            <div
+                              key={`${hop.hopIndex}-${hop.versionedHash}`}
+                              className="px-3.5 py-2.5 space-y-1 text-[11px]"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="font-semibold text-slate-900">
+                                  Hop {hop.hopIndex} · CDM nonce #{nonceCounter.toString()}
+                                </span>
+                                <span
+                                  className={`font-mono font-semibold ${
+                                    hop.standaloneRelayPassed === false
+                                      ? 'text-red-700'
+                                      : blockedByEarlierHop
+                                      ? 'text-slate-500'
+                                      : hop.standaloneRelayPassed === true
+                                      ? 'text-emerald-700'
+                                      : 'text-slate-600'
+                                  }`}
+                                >
+                                  {hop.standaloneRelayPassed === false
+                                    ? 'Revert（本番実行時はここで停止）'
+                                    : blockedByEarlierHop
+                                    ? '単体テスト時はPASS（本番ではHop 1停止のため未到達）'
+                                    : hop.standaloneRelayPassed === true
+                                    ? 'フレーム実行: PASS'
+                                    : 'オンチェーン状態照会済'}
+                                </span>
+                              </div>
+                              <div className="font-mono text-slate-600 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                <span title={hop.sender}>
+                                  sender: {hop.sender.slice(0, 10)}...{hop.sender.slice(-6)}
+                                </span>
+                                <span aria-hidden="true">→</span>
+                                <span title={hop.target}>
+                                  target: {hop.target.slice(0, 10)}...{hop.target.slice(-6)}
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>minGas: {Number(hop.minGasLimit).toLocaleString()}</span>
+                              </div>
+                              <div className="font-mono text-slate-600 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                <span title={hop.versionedHash}>
+                                  versionedHash: {hop.versionedHash.slice(0, 12)}...
+                                  {hop.versionedHash.slice(-6)}
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>
+                                  successfulMessages: {String(hop.successfulMessage ?? '—')}
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>
+                                  failedMessages: {String(hop.failedMessage ?? '—')}
+                                </span>
+                              </div>
+                              {hop.standaloneRelayError && (
+                                <div className="font-mono text-red-700 break-words">
+                                  Revert理由: {hop.standaloneRelayError}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
                   {/* 5-Step Withdrawal Validation Logic Checklist */}
                   {val && val.checks.length > 0 && (
                     <div className="border border-slate-200 rounded-xl divide-y divide-slate-100">
@@ -614,7 +839,10 @@ export function TxInspectorDrawer({
                   externalSimResult={simResult}
                   externalIsSimulating={isSimulating}
                   onRunExternalSimulation={handleRunL1Sim}
-                  onWithdrawalUpdated={(updated) => setLocalWithdrawal(updated)}
+                  onWithdrawalUpdated={(updated) => {
+                    setLocalWithdrawal(updated);
+                    onWithdrawalUpdatedGlobal?.(result.hash, updated);
+                  }}
                   onExecutionCompleted={handleRunL1Sim}
                 />
               </div>
@@ -624,59 +852,102 @@ export function TxInspectorDrawer({
           {/* Audit Metadata Grid */}
           <div>
             <h4 className="text-xs font-semibold text-slate-500 mb-3">
-              オンチェーン検証データ詳細
+              {isWithdrawalTx
+                ? '出金トランザクション・コントラクト詳細'
+                : 'オンチェーン検証データ詳細'}
             </h4>
             <dl className="border border-slate-200 rounded-xl divide-y divide-slate-100 text-xs">
               <div className="px-4 py-2.5 flex items-center justify-between gap-4">
-                <dt className="text-slate-500 shrink-0">L2 ブロック番号 / 時刻</dt>
+                <dt className="text-slate-500 shrink-0">L2 収録ブロック番号 / 時刻</dt>
                 <dd className="font-mono tabular-nums text-slate-900 text-right">
                   {result.blockNumber !== null
-                    ? `#${result.blockNumber.toLocaleString()} (${formatUnixTimestamp(
-                        result.blockTimestamp
-                      )})`
+                    ? `#${result.blockNumber.toLocaleString()}${
+                        result.blockTimestamp !== null
+                          ? ` (${formatUnixTimestamp(result.blockTimestamp)})`
+                          : ''
+                      }`
                     : '—'}
                 </dd>
               </div>
-              <div className="px-4 py-2.5 flex items-center justify-between gap-4">
-                <dt className="text-slate-500 shrink-0">L2 確認数 (vs Latest)</dt>
-                <dd className="font-mono tabular-nums text-slate-900 text-right">
-                  {result.confirmations !== null
-                    ? `${result.confirmations.toLocaleString()} ブロック`
-                    : '—'}
-                </dd>
-              </div>
-              <div className="px-4 py-2.5 flex items-center justify-between gap-4">
-                <dt className="text-slate-500 shrink-0">L1 Origin ブロック (L1Block Predeploy)</dt>
-                <dd className="font-mono tabular-nums text-slate-900 text-right flex items-center gap-1.5">
-                  {result.l1OriginBlock !== null ? (
-                    <>
-                      <span>#{result.l1OriginBlock.toLocaleString()}</span>
-                      {result.l1OriginIsFinalized !== null && (
-                        <span
-                          className={
-                            result.l1OriginIsFinalized ? 'text-emerald-700' : 'text-amber-700'
-                          }
-                        >
-                          ({result.l1OriginIsFinalized ? 'L1 Finalized済' : 'L1 確定待ち'})
-                        </span>
-                      )}
-                      {l1ExplorerUrl && (
-                        <a
-                          href={`${l1ExplorerUrl}/block/${result.l1OriginBlock}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-slate-400 hover:text-[#0052FF]"
-                          aria-label="EtherscanでL1ブロックを見る"
-                        >
-                          <ExternalLink className="w-3.5 h-3.5" />
-                        </a>
-                      )}
-                    </>
-                  ) : (
-                    '—'
+              {isWithdrawalTx && activeWithdrawal ? (
+                <>
+                  <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+                    <dt className="text-slate-500 shrink-0">withdrawalHash</dt>
+                    <dd className="font-mono text-slate-900 truncate">
+                      {activeWithdrawal.withdrawalHash}
+                    </dd>
+                  </div>
+                  <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+                    <dt className="text-slate-500 shrink-0">MessagePasser Nonce</dt>
+                    <dd className="font-mono tabular-nums text-slate-900 truncate">
+                      {activeWithdrawal.nonce}
+                    </dd>
+                  </div>
+                  {activeWithdrawal.validation?.portalAddress && (
+                    <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+                      <dt className="text-slate-500 shrink-0">L1 OptimismPortal2</dt>
+                      <dd className="font-mono text-slate-900 truncate">
+                        {activeWithdrawal.validation.portalAddress}
+                      </dd>
+                    </div>
                   )}
-                </dd>
-              </div>
+                  {activeWithdrawal.validation?.disputeGameAddress && (
+                    <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+                      <dt className="text-slate-500 shrink-0">L1 DisputeGameProxy</dt>
+                      <dd className="font-mono text-slate-900 truncate">
+                        {activeWithdrawal.validation.disputeGameAddress}
+                      </dd>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+                    <dt className="text-slate-500 shrink-0">L2 確認数 (vs Latest)</dt>
+                    <dd className="font-mono tabular-nums text-slate-900 text-right">
+                      {result.confirmations !== null
+                        ? `${result.confirmations.toLocaleString()} ブロック`
+                        : '—'}
+                    </dd>
+                  </div>
+                  <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+                    <dt className="text-slate-500 shrink-0">
+                      L1 Origin ブロック (L1Block Predeploy)
+                    </dt>
+                    <dd className="font-mono tabular-nums text-slate-900 text-right flex items-center gap-1.5">
+                      {result.l1OriginBlock !== null ? (
+                        <>
+                          <span>#{result.l1OriginBlock.toLocaleString()}</span>
+                          {result.l1OriginIsFinalized !== null && (
+                            <span
+                              className={
+                                result.l1OriginIsFinalized
+                                  ? 'text-emerald-700'
+                                  : 'text-amber-700'
+                              }
+                            >
+                              ({result.l1OriginIsFinalized ? 'L1 Finalized済' : 'L1 確定待ち'})
+                            </span>
+                          )}
+                          {l1ExplorerUrl && (
+                            <a
+                              href={`${l1ExplorerUrl}/block/${result.l1OriginBlock}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-slate-400 hover:text-[#0052FF]"
+                              aria-label="EtherscanでL1ブロックを見る"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          )}
+                        </>
+                      ) : (
+                        '—'
+                      )}
+                    </dd>
+                  </div>
+                </>
+              )}
               <div className="px-4 py-2.5 flex items-center justify-between gap-4">
                 <dt className="text-slate-500 shrink-0">From アドレス</dt>
                 <dd className="font-mono text-slate-900 truncate">{result.from ?? '—'}</dd>
@@ -711,16 +982,20 @@ export function TxInspectorDrawer({
                     : '—'}
                 </dd>
               </div>
-              <div className="px-4 py-2.5 flex items-center justify-between gap-4">
-                <dt className="text-slate-500 shrink-0">照合基準ヘッド (Finalized / Safe)</dt>
-                <dd className="font-mono tabular-nums text-slate-600 text-right">
-                  {snapshot?.finalized
-                    ? `#${snapshot.finalized.number.toLocaleString()} / #${
-                        snapshot.safe?.number.toLocaleString() ?? '—'
-                      }`
-                    : '—'}
-                </dd>
-              </div>
+              {!isWithdrawalTx && (
+                <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+                  <dt className="text-slate-500 shrink-0">
+                    照合基準ヘッド (Finalized / Safe)
+                  </dt>
+                  <dd className="font-mono tabular-nums text-slate-600 text-right">
+                    {snapshot?.finalized
+                      ? `#${snapshot.finalized.number.toLocaleString()} / #${
+                          snapshot.safe?.number.toLocaleString() ?? '—'
+                        }`
+                      : '—'}
+                  </dd>
+                </div>
+              )}
             </dl>
           </div>
 

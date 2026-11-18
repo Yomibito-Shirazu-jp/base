@@ -1,4 +1,4 @@
-import type { Hex } from 'viem';
+import { toHex, type Hex } from 'viem';
 import {
   BlockHeadInfo,
   ChainHeadSnapshot,
@@ -14,8 +14,24 @@ import {
 } from '../types/finality';
 import {
   L2_TO_L1_MESSAGE_PASSER,
+  MESSAGE_PASSED_TOPIC0,
+  analyzeWithdrawalFromReceipt,
   analyzeWithdrawalFromTxHash,
+  createBaseAndL1Clients,
+  warmPortalDisputeParams,
 } from './withdrawalAnalyzer';
+
+function hasMessagePassedLog(
+  logs?: Array<{ address?: string; topics?: readonly string[] | string[] }> | null
+): boolean {
+  return Boolean(
+    logs?.some(
+      (l) =>
+        l.address?.toLowerCase() === L2_TO_L1_MESSAGE_PASSER &&
+        l.topics?.[0]?.toLowerCase() === MESSAGE_PASSED_TOPIC0
+    )
+  );
+}
 
 export const NETWORK_PRESETS: Record<Exclude<NetworkId, 'custom'>, NetworkConfig> = {
   'base-mainnet': {
@@ -38,9 +54,8 @@ export const NETWORK_PRESETS: Record<Exclude<NetworkId, 'custom'>, NetworkConfig
   },
 };
 
-// OP Stack L1Block predeploy address on Base
+// OP Stack L1Block predeploy address on Base (used strictly for general L2 finality tab, NOT withdrawals)
 const L1_BLOCK_PREDEPLOY = '0x4200000000000000000000000000000000000015';
-// Function selectors on L1Block: number() and timestamp()
 const L1_BLOCK_NUMBER_SELECTOR = '0x8381f58a';
 const L1_BLOCK_TIMESTAMP_SELECTOR = '0xb80777ea';
 
@@ -95,6 +110,26 @@ const PREFERRED_TX_HASH_KEYS = new Set([
   'hash',
 ]);
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  let cursor = 0;
+  const runners = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const currentIndex = cursor;
+        cursor += 1;
+        await worker(items[currentIndex], currentIndex);
+      }
+    }
+  );
+  await Promise.all(runners);
+}
+
 function collectHashesFromJsonValue(
   value: unknown,
   parentKey: string | null,
@@ -127,21 +162,22 @@ function collectHashesFromJsonValue(
     const obj = value as Record<string, unknown>;
     const keyLower = parentKey?.toLowerCase() ?? '';
 
-    // Skip chainHeads metadata block objects (latest / safe / finalized)
     if (keyLower === 'chainheads') {
       return;
     }
 
-    // If this object looks like a block header containing a `transactions` array, skip its block `hash`
     if (Array.isArray(obj.transactions) && ('number' in obj || 'parentHash' in obj)) {
       collectHashesFromJsonValue(obj.transactions, 'transactions', onHashFound);
       return;
     }
 
-    // If the object has explicit tx hash properties, prefer them and avoid picking up sibling blockHash/etc.
     let foundPreferred = false;
     for (const [k, v] of Object.entries(obj)) {
-      if (PREFERRED_TX_HASH_KEYS.has(k.toLowerCase()) && typeof v === 'string' && TX_HASH_REGEX.test(v.trim())) {
+      if (
+        PREFERRED_TX_HASH_KEYS.has(k.toLowerCase()) &&
+        typeof v === 'string' &&
+        TX_HASH_REGEX.test(v.trim())
+      ) {
         onHashFound(v.trim().toLowerCase());
         foundPreferred = true;
       }
@@ -204,13 +240,11 @@ export function parseTxHashes(rawInput: string): ParsedHashBatch {
     .filter(Boolean);
 
   for (const token of lines) {
-    // Check if token itself is a valid 32-byte hash
     if (TX_HASH_REGEX.test(token)) {
       pushValid(token);
       continue;
     }
 
-    // Try extracting hashes from explorer URLs or JSON/CSV fragments
     const matches = token.match(TX_HASH_EXTRACT_REGEX);
     if (matches && matches.length > 0) {
       for (const m of matches) {
@@ -219,7 +253,6 @@ export function parseTxHashes(rawInput: string): ParsedHashBatch {
       continue;
     }
 
-    // Ignore obvious CSV header names like "tx_hash" or "transactionHash"
     const lower = token.toLowerCase();
     if (
       lower === 'txhash' ||
@@ -466,9 +499,9 @@ export function computeReliability(
   if (row.finality === FinalityStage.RPC_ERROR) {
     return {
       tier: 'partial',
-      label: 'RPC取得エラー',
-      basis: ['Base L2 JSON-RPC照会失敗'],
-      caveat: row.errorReason ?? '再実行ボタンで該当ハッシュのみ再照会できます',
+      label: 'RPC取得エラー (要再取得)',
+      basis: ['JSON-RPC照会失敗'],
+      caveat: row.errorReason ?? '再取得ボタンで該当ハッシュのみ再照会できます',
     };
   }
 
@@ -485,9 +518,56 @@ export function computeReliability(
     };
   }
 
-  const hasWithdrawalLog = Boolean(
-    row.rawReceipt?.logs?.some((l) => l.address?.toLowerCase() === L2_TO_L1_MESSAGE_PASSER)
+  const isWithdrawalCandidate = Boolean(
+    row.withdrawal !== null ||
+      (row.rawReceipt?.logs
+        ? hasMessagePassedLog(row.rawReceipt.logs)
+        : row.hasWithdrawalLog === true)
   );
+
+  // Withdrawal transactions are evaluated strictly by real OP Stack withdrawal contracts
+  // (L2ToL1MessagePasser + OptimismPortal2 + DisputeGameFactory / AggregateVerifier)
+  // without unrelated L2 Casper FFG / L1Block Predeploy checks.
+  if (isWithdrawalCandidate) {
+    const withdrawalBasis = [
+      'L2ToL1MessagePasser (sentMessages & MPT証明)',
+      'L1 OptimismPortal2 (provenWithdrawals / checkWithdrawal / finalizedWithdrawals)',
+      'L1 DisputeGameFactory / AggregateVerifier (TEE・ZK)',
+    ];
+
+    if (
+      !row.withdrawal ||
+      !row.withdrawal.validation ||
+      row.withdrawal.usedFallbackDelay
+    ) {
+      return {
+        tier: 'partial',
+        label: '未取得あり (要再取得)',
+        basis: ['L2ToL1MessagePasser ログ検出'],
+        caveat:
+          'L2ToL1MessagePasser ログを検出しましたが、L1 OptimismPortal2 の状態取得が未完了です。未取得項目を再取得します。',
+      };
+    }
+
+    if (
+      row.withdrawal.portalFinalized ||
+      row.withdrawal.status === 'ready-to-finalize'
+    ) {
+      return {
+        tier: 'verified_onchain',
+        label: 'OptimismPortal2 実測確定',
+        basis: withdrawalBasis,
+        caveat: null,
+      };
+    }
+
+    return {
+      tier: 'estimated_pending',
+      label: 'OptimismPortal2 検証済',
+      basis: withdrawalBasis,
+      caveat: null,
+    };
+  }
 
   const basis: string[] = [
     `L2 Receipt & Tx (${snapshot.isServerProxy ? 'Archive Proxy' : 'JSON-RPC'})`,
@@ -500,63 +580,6 @@ export function computeReliability(
     basis.push('Ethereum L1 Finalized Head');
   }
 
-  if (hasWithdrawalLog) {
-    if (!row.withdrawal) {
-      return {
-        tier: 'partial',
-        label: '部分照合 (L1未照会)',
-        basis,
-        caveat:
-          'L2ToL1MessagePasser ログを検出しましたが、L1 OptimismPortal2 の状態取得に失敗しました。再実行してください。',
-      };
-    }
-
-    basis.push('L2ToL1MessagePasser.sentMessages & MPTストレージ証明');
-    basis.push('L1 OptimismPortal2.finalizedWithdrawals / paused / DisputeGame');
-    if (row.withdrawal.validation?.outerPortalRelaySimulated) {
-      basis.push('L1 stateOverride 待機後ブリッジ着金ドライラン');
-    }
-
-    if (snapshot.l1Head.finalizedNumber === null) {
-      return {
-        tier: 'partial',
-        label: '部分照合 (L1ヘッド未取得)',
-        basis,
-        caveat: 'L1 RPC の確定ヘッドに接続できなかったため一部比較が省略されています。',
-      };
-    }
-
-    if (row.withdrawal.usedFallbackDelay) {
-      return {
-        tier: 'estimated_pending',
-        label: '一部推定を含む (フォールバック値使用)',
-        basis,
-        caveat:
-          'L1の一部タイムスタンプ/遅延呼び出しでフォールバック値を使用したため、残り時間は概算です（MessagePasser・L1着金可否は実測済み）。',
-      };
-    }
-
-    if (
-      row.withdrawal.status === 'finalized' ||
-      row.withdrawal.status === 'ready-to-finalize'
-    ) {
-      return {
-        tier: 'verified_onchain',
-        label: 'オンチェーン実測確定',
-        basis,
-        caveat: null,
-      };
-    }
-
-    return {
-      tier: 'estimated_pending',
-      label: 'L1着金検証済・時刻のみ推定',
-      basis,
-      caveat:
-        'MessagePasser証明・L1支払原資・待機経過後の着金ドライランは実測確認済みです（完了予定日時のみ DisputeGame 進行に依存）。',
-    };
-  }
-
   if (row.l1OriginBlock === null || snapshot.l1Head.finalizedNumber === null) {
     const caveats: string[] = [];
     if (row.l1OriginBlock === null) {
@@ -567,7 +590,7 @@ export function computeReliability(
     }
     return {
       tier: 'partial',
-      label: '部分照合',
+      label: '部分照合 (未取得あり)',
       basis,
       caveat: caveats.join(' / '),
     };
@@ -591,6 +614,314 @@ export function computeReliability(
   };
 }
 
+/**
+ * Dedicated OP Stack Withdrawal-Only batch verifier (`withdrawal-verify` tab).
+ * Queries ONLY L2 transaction receipts (`L2ToL1MessagePasser`) + L1 `OptimismPortal2` + `DisputeGameFactory / AggregateVerifier`
+ * with bounded concurrency and retry — zero unrelated L2 Safe/Finalized head or L1Block Predeploy calls!
+ */
+export async function verifyWithdrawalsOnlyBatch(
+  parsed: ParsedHashBatch,
+  config: NetworkConfig,
+  onProgress?: (completed: number, total: number, phase: string) => void
+): Promise<{ snapshot: ChainHeadSnapshot; results: VerifiedTransactionResult[] }> {
+  const totalCount = parsed.validHashes.length + parsed.invalidTokens.length;
+  onProgress?.(0, totalCount, 'L1 OptimismPortal2 & AggregateVerifier 設定を取得中...');
+
+  const clients = createBaseAndL1Clients(config);
+  const { l1Client, l2Client } = clients;
+
+  const [, l2LatestBlk, l1LatestNum] = await Promise.all([
+    warmPortalDisputeParams(config).catch(() => {}),
+    l2Client.getBlock({ blockTag: 'latest' }).catch(() => null),
+    l1Client.getBlockNumber().catch(() => null),
+  ]);
+
+  const endpointUsed = config.rpcUrls[0] ?? '';
+  const snapshot: ChainHeadSnapshot = {
+    networkId: config.id,
+    networkName: config.name,
+    chainId: config.chainId,
+    rpcEndpointUsed: endpointUsed,
+    isServerProxy: endpointUsed.startsWith('/api/rpc/'),
+    fetchedAt: Date.now(),
+    latest: l2LatestBlk
+      ? {
+          number: Number(l2LatestBlk.number),
+          hash: l2LatestBlk.hash,
+          timestamp: Number(l2LatestBlk.timestamp),
+        }
+      : null,
+    safe: null,
+    finalized: null,
+    l1Head: {
+      latestNumber: l1LatestNum !== null ? Number(l1LatestNum) : null,
+      finalizedNumber: l1LatestNum !== null ? Number(l1LatestNum) : null,
+      rpcEndpointUsed: config.l1RpcUrls[0] ?? null,
+    },
+  };
+
+  const validResultsByIdx: Array<VerifiedTransactionResult | null> = new Array(
+    parsed.validHashes.length
+  ).fill(null);
+
+  let completedCount = 0;
+
+  await runWithConcurrency(parsed.validHashes, 3, async (hash, idx) => {
+    onProgress?.(
+      completedCount,
+      totalCount,
+      `出金コントラクト検証中 (${Math.min(completedCount + 1, parsed.validHashes.length)} / ${parsed.validHashes.length})...`
+    );
+
+    try {
+      let receipt = null;
+      let receiptErr: Error | null = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          receipt = await l2Client.getTransactionReceipt({ hash: hash as Hex });
+          receiptErr = null;
+          break;
+        } catch (err) {
+          receiptErr = err instanceof Error ? err : new Error(String(err));
+          if (attempt < 2) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        }
+      }
+
+      if (!receipt) {
+        const txPending = await l2Client
+          .getTransaction({ hash: hash as Hex })
+          .catch(() => null);
+
+        if (txPending && txPending.blockNumber === null) {
+          const pendingRow: Omit<VerifiedTransactionResult, 'reliability'> = {
+            index: idx + 1,
+            inputToken: hash,
+            hash,
+            finality: FinalityStage.PENDING,
+            executionStatus: ExecutionStatus.PENDING,
+            blockNumber: null,
+            blockHash: null,
+            blockTimestamp: null,
+            txIndex: null,
+            from: txPending.from,
+            to: txPending.to ?? null,
+            nonce: txPending.nonce,
+            valueEth: formatWeiToEth(txPending.value, 6),
+            confirmations: null,
+            blocksToSafe: null,
+            blocksToFinalized: null,
+            l1OriginBlock: null,
+            l1OriginIsFinalized: null,
+            gasUsed: null,
+            l2FeeEth: null,
+            l1FeeEth: null,
+            totalFeeEth: null,
+            logsCount: null,
+            txType: txPending.type ?? null,
+            errorReason: null,
+            hasWithdrawalLog: false,
+            rawTx: null,
+            rawReceipt: null,
+            withdrawal: null,
+          };
+          validResultsByIdx[idx] = {
+            ...pendingRow,
+            reliability: computeReliability(pendingRow, snapshot),
+          };
+          return;
+        }
+
+        const errMsg = receiptErr?.message ?? '';
+        const isNotFound =
+          errMsg.toLowerCase().includes('not be found') ||
+          errMsg.toLowerCase().includes('not found');
+
+        const missingRow: Omit<VerifiedTransactionResult, 'reliability'> = {
+          index: idx + 1,
+          inputToken: hash,
+          hash,
+          finality: isNotFound ? FinalityStage.NOT_FOUND : FinalityStage.RPC_ERROR,
+          executionStatus: ExecutionStatus.UNKNOWN,
+          blockNumber: null,
+          blockHash: null,
+          blockTimestamp: null,
+          txIndex: null,
+          from: null,
+          to: null,
+          nonce: null,
+          valueEth: null,
+          confirmations: null,
+          blocksToSafe: null,
+          blocksToFinalized: null,
+          l1OriginBlock: null,
+          l1OriginIsFinalized: null,
+          gasUsed: null,
+          l2FeeEth: null,
+          l1FeeEth: null,
+          totalFeeEth: null,
+          logsCount: null,
+          txType: null,
+          errorReason: isNotFound
+            ? '指定ネットワークのオンチェーン上に該当ハッシュが見つかりません'
+            : errMsg || 'L2 レシートの取得に失敗しました',
+          hasWithdrawalLog: false,
+          rawTx: null,
+          rawReceipt: null,
+          withdrawal: null,
+        };
+        validResultsByIdx[idx] = {
+          ...missingRow,
+          reliability: computeReliability(missingRow, snapshot),
+        };
+        return;
+      }
+
+      const hasMpLog = hasMessagePassedLog(receipt.logs);
+
+      let withdrawal = null;
+      if (hasMpLog && receipt.status !== 'reverted') {
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            withdrawal = await analyzeWithdrawalFromReceipt(receipt, config, clients);
+            break;
+          } catch {
+            if (attempt < 3) {
+              await new Promise((r) => setTimeout(r, 500 * attempt));
+            }
+          }
+        }
+      }
+
+      const blockNum = Number(receipt.blockNumber);
+      const gasUsedBig = receipt.gasUsed;
+      const effGasPrice = receipt.effectiveGasPrice ?? 0n;
+      const l1FeeBig =
+        (receipt as unknown as { l1Fee?: bigint | null }).l1Fee ?? 0n;
+      const l2FeeWei = gasUsedBig * effGasPrice;
+      const totalFeeWei = l2FeeWei + l1FeeBig;
+
+      const rawRc: RawReceiptData = {
+        transactionHash: receipt.transactionHash,
+        blockNumber: toHex(receipt.blockNumber),
+        blockHash: receipt.blockHash,
+        status: receipt.status === 'reverted' ? '0x0' : '0x1',
+        gasUsed: toHex(receipt.gasUsed),
+        effectiveGasPrice: toHex(effGasPrice),
+        l1Fee: toHex(l1FeeBig),
+        logs: receipt.logs.map((l) => ({
+          address: l.address,
+          topics: l.topics as string[],
+          data: l.data,
+        })),
+      };
+
+      const baseRow: Omit<VerifiedTransactionResult, 'reliability'> = {
+        index: idx + 1,
+        inputToken: hash,
+        hash,
+        finality: FinalityStage.FINALIZED,
+        executionStatus:
+          receipt.status === 'reverted'
+            ? ExecutionStatus.REVERTED
+            : ExecutionStatus.SUCCESS,
+        blockNumber: blockNum,
+        blockHash: receipt.blockHash,
+        blockTimestamp: null,
+        txIndex: receipt.transactionIndex,
+        from: receipt.from,
+        to: receipt.to ?? null,
+        nonce: null,
+        valueEth: withdrawal?.assetType === 'ETH' ? withdrawal.amountFormatted : null,
+        confirmations:
+          snapshot.latest !== null
+            ? Math.max(0, snapshot.latest.number - blockNum)
+            : null,
+        blocksToSafe: 0,
+        blocksToFinalized: 0,
+        l1OriginBlock: null,
+        l1OriginIsFinalized: null,
+        gasUsed: gasUsedBig.toString(),
+        l2FeeEth: formatWeiToEth(l2FeeWei, 8),
+        l1FeeEth: formatWeiToEth(l1FeeBig, 8),
+        totalFeeEth: formatWeiToEth(totalFeeWei, 8),
+        logsCount: receipt.logs.length,
+        txType: receipt.type ?? null,
+        errorReason: null,
+        hasWithdrawalLog: hasMpLog,
+        rawTx: null,
+        rawReceipt: rawRc,
+        withdrawal,
+      };
+
+      validResultsByIdx[idx] = {
+        ...baseRow,
+        reliability: hasMpLog
+          ? computeReliability(baseRow, snapshot)
+          : {
+              tier: 'verified_onchain',
+              label: '出金イベントなし (通常L2 Tx)',
+              basis: ['L2 Transaction Receipt (MessagePassed イベント照合)'],
+              caveat:
+                'L2ToL1MessagePasser の MessagePassed (出金) イベントが含まれていないため、L1 OptimismPortal2 出金の対象外です。',
+            },
+      };
+    } finally {
+      completedCount += 1;
+      onProgress?.(
+        completedCount,
+        totalCount,
+        `出金コントラクト検証済 (${completedCount} / ${parsed.validHashes.length})...`
+      );
+    }
+  });
+
+  const results: VerifiedTransactionResult[] = [];
+  for (const r of validResultsByIdx) {
+    if (r) results.push(r);
+  }
+
+  let nextIdx = results.length + 1;
+  for (const invalid of parsed.invalidTokens) {
+    const invRow: Omit<VerifiedTransactionResult, 'reliability'> = {
+      index: nextIdx++,
+      inputToken: invalid,
+      hash: invalid,
+      finality: FinalityStage.INVALID,
+      executionStatus: ExecutionStatus.UNKNOWN,
+      blockNumber: null,
+      blockHash: null,
+      blockTimestamp: null,
+      txIndex: null,
+      from: null,
+      to: null,
+      nonce: null,
+      valueEth: null,
+      confirmations: null,
+      blocksToSafe: null,
+      blocksToFinalized: null,
+      l1OriginBlock: null,
+      l1OriginIsFinalized: null,
+      gasUsed: null,
+      l2FeeEth: null,
+      l1FeeEth: null,
+      totalFeeEth: null,
+      logsCount: null,
+      txType: null,
+      errorReason: '64桁の16進Txハッシュ形式 (0x...) ではありません',
+      hasWithdrawalLog: false,
+      rawTx: null,
+      rawReceipt: null,
+      withdrawal: null,
+    };
+    results.push({ ...invRow, reliability: computeReliability(invRow, snapshot) });
+  }
+
+  onProgress?.(totalCount, totalCount, '出金検証完了');
+  return { snapshot, results };
+}
+
 export async function verifyTransactionsBatch(
   parsed: ParsedHashBatch,
   config: NetworkConfig,
@@ -605,7 +936,6 @@ export async function verifyTransactionsBatch(
     ...config.rpcUrls.filter((u) => u !== snapshot.rpcEndpointUsed),
   ];
 
-  // Chunk valid hashes into batches of 15 (30 RPC calls per HTTP POST)
   const CHUNK_SIZE = 15;
   const txMap = new Map<string, RawTxData | null>();
   const receiptMap = new Map<string, RawReceiptData | null>();
@@ -670,14 +1000,19 @@ export async function verifyTransactionsBatch(
     processedValid += chunk.length;
   }
 
-  // Collect unique L2 block numbers to fetch block timestamps and L1 origin anchor
+  // Collect unique L2 block numbers (skip L1Block predeploy for pure withdrawal txs if desired, or fetch cleanly)
   const uniqueBlockHexes = new Set<string>();
+  const nonWithdrawalBlockHexes = new Set<string>();
   for (const hash of parsed.validHashes) {
     const tx = txMap.get(hash);
     const rc = receiptMap.get(hash);
     const blockHex = rc?.blockNumber ?? tx?.blockNumber;
+    const isWithdrawal = hasMessagePassedLog(rc?.logs);
     if (blockHex && blockHex !== '0x') {
       uniqueBlockHexes.add(blockHex);
+      if (!isWithdrawal) {
+        nonWithdrawalBlockHexes.add(blockHex);
+      }
     }
   }
 
@@ -689,7 +1024,7 @@ export async function verifyTransactionsBatch(
     onProgress?.(
       processedValid,
       totalCount,
-      `対象ブロック (${uniqueBlocksList.length}件) のタイムスタンプとL1アンカーを取得中...`
+      `対象ブロック (${uniqueBlocksList.length}件) のタイムスタンプを取得中...`
     );
 
     const BLOCK_CHUNK = 15;
@@ -704,12 +1039,14 @@ export async function verifyTransactionsBatch(
           method: 'eth_getBlockByNumber',
           params: [blockHex, false],
         });
-        blockReqs.push({
-          jsonrpc: '2.0',
-          id: idx * 2 + 2,
-          method: 'eth_call',
-          params: [{ to: L1_BLOCK_PREDEPLOY, data: L1_BLOCK_NUMBER_SELECTOR }, blockHex],
-        });
+        if (nonWithdrawalBlockHexes.has(blockHex)) {
+          blockReqs.push({
+            jsonrpc: '2.0',
+            id: idx * 2 + 2,
+            method: 'eth_call',
+            params: [{ to: L1_BLOCK_PREDEPLOY, data: L1_BLOCK_NUMBER_SELECTOR }, blockHex],
+          });
+        }
       });
 
       try {
@@ -728,7 +1065,32 @@ export async function verifyTransactionsBatch(
           }
         });
       } catch {
-        // Non-fatal: block metadata fallback remains null
+        // Non-fatal: retry missed L1 origins below
+      }
+    }
+
+    // Retry any missed non-withdrawal L1 origin block once
+    const missedOriginBlocks = Array.from(nonWithdrawalBlockHexes).filter(
+      (b) => !blockL1Origins.has(b)
+    );
+    if (missedOriginBlocks.length > 0 && missedOriginBlocks.length <= 30) {
+      try {
+        const retryReqs: JsonRpcRequest[] = missedOriginBlocks.map((blockHex, idx) => ({
+          jsonrpc: '2.0',
+          id: idx + 1,
+          method: 'eth_call',
+          params: [{ to: L1_BLOCK_PREDEPLOY, data: L1_BLOCK_NUMBER_SELECTOR }, blockHex],
+        }));
+        const { responses } = await postJsonRpcBatch(activeRpcUrls, retryReqs);
+        missedOriginBlocks.forEach((blockHex, idx) => {
+          const l1Res = responses.get(idx + 1) as JsonRpcResponse<string> | undefined;
+          if (l1Res && !l1Res.error && l1Res.result && l1Res.result !== '0x') {
+            const l1Num = hexToNumber(l1Res.result);
+            if (l1Num !== null) blockL1Origins.set(blockHex, l1Num);
+          }
+        });
+      } catch {
+        // Ignore
       }
     }
   }
@@ -768,6 +1130,7 @@ export async function verifyTransactionsBatch(
         logsCount: null,
         txType: null,
         errorReason: rpcErr,
+        hasWithdrawalLog: false,
         rawTx: null,
         rawReceipt: null,
         withdrawal: null,
@@ -803,6 +1166,7 @@ export async function verifyTransactionsBatch(
         logsCount: null,
         txType: null,
         errorReason: '指定ネットワークのオンチェーン上に該当ハッシュが見つかりません',
+        hasWithdrawalLog: false,
         rawTx: null,
         rawReceipt: null,
         withdrawal: null,
@@ -814,6 +1178,7 @@ export async function verifyTransactionsBatch(
     const blockHex = rc?.blockNumber ?? tx?.blockNumber ?? null;
     const blockNumber = hexToNumber(blockHex);
     const blockHash = rc?.blockHash ?? tx?.blockHash ?? null;
+    const hasWithdrawalLog = hasMessagePassedLog(rc?.logs);
 
     let finality: FinalityStage;
     if (blockNumber === null) {
@@ -834,7 +1199,6 @@ export async function verifyTransactionsBatch(
     } else if (rc.status === '0x0') {
       executionStatus = ExecutionStatus.REVERTED;
     } else {
-      // System deposit txs on OP Stack without explicit status field default to success when included
       executionStatus = ExecutionStatus.SUCCESS;
     }
 
@@ -903,6 +1267,7 @@ export async function verifyTransactionsBatch(
       logsCount: rc?.logs ? rc.logs.length : null,
       txType: tx?.type ?? null,
       errorReason: null,
+      hasWithdrawalLog,
       rawTx: tx,
       rawReceipt: rc,
       withdrawal: null,
@@ -937,6 +1302,7 @@ export async function verifyTransactionsBatch(
       logsCount: null,
       txType: null,
       errorReason: '64桁の16進Txハッシュ形式 (0x...) ではありません',
+      hasWithdrawalLog: false,
       rawTx: null,
       rawReceipt: null,
       withdrawal: null,
@@ -944,38 +1310,47 @@ export async function verifyTransactionsBatch(
     results.push({ ...baseRow, reliability: computeReliability(baseRow, snapshot) });
   }
 
-  // Enrich any L2 -> L1 withdrawal transactions with live OptimismPortal2 remaining time & amount
-  const withdrawalCandidates = results.filter((r) =>
-    r.rawReceipt?.logs?.some((l) => l.address?.toLowerCase() === L2_TO_L1_MESSAGE_PASSER)
+  const withdrawalCandidates = results.filter(
+    (r) =>
+      r.hasWithdrawalLog &&
+      r.executionStatus !== ExecutionStatus.REVERTED
   );
 
   if (withdrawalCandidates.length > 0) {
     onProgress?.(
       totalCount,
       totalCount,
-      `L2→L1 出金Tx (${withdrawalCandidates.length}件) のL1残存時間と金額を照会中...`
+      `L2→L1 出金Tx (${withdrawalCandidates.length}件) の OptimismPortal2 状態を照会中...`
     );
-    await Promise.all(
-      withdrawalCandidates.map(async (item) => {
+    await warmPortalDisputeParams(config).catch(() => {});
+
+    let completedW = 0;
+    await runWithConcurrency(withdrawalCandidates, 3, async (item) => {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
           const info = await analyzeWithdrawalFromTxHash(item.hash as Hex, config);
           item.withdrawal = info;
+          break;
         } catch {
-          // Non-fatal: keep withdrawal null if L1 query fails
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, 500 * attempt));
+          }
         }
-        item.reliability = computeReliability(item, snapshot);
-      })
-    );
+      }
+      item.reliability = computeReliability(item, snapshot);
+      completedW += 1;
+      onProgress?.(
+        totalCount,
+        totalCount,
+        `L2→L1 出金Tx (${completedW}/${withdrawalCandidates.length}件) の OptimismPortal2 照会中...`
+      );
+    });
   }
 
   onProgress?.(totalCount, totalCount, '検証完了');
   return { snapshot, results };
 }
 
-/**
- * Fetches live real transaction hashes directly from the chain's finalized, safe,
- * and latest blocks so users can immediately test batch verification across all 3 finality stages.
- */
 export async function fetchLiveOnChainSamples(config: NetworkConfig): Promise<string[]> {
   const { responses } = await postJsonRpcBatch(config.rpcUrls, [
     { jsonrpc: '2.0', id: 1, method: 'eth_getBlockByNumber', params: ['finalized', true] },
@@ -989,7 +1364,6 @@ export async function fetchLiveOnChainSamples(config: NetworkConfig): Promise<st
   const extractFromBlock = (res: JsonRpcResponse<RpcBlock> | undefined, maxCount: number) => {
     const txs = res?.result?.transactions;
     if (!Array.isArray(txs)) return;
-    // Prefer non-system user transactions (type !== '0x7e') first, then fallback
     const userTxs = txs.filter(
       (t): t is RawTxData => typeof t === 'object' && t !== null && t.type !== '0x7e'
     );

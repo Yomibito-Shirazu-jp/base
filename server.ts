@@ -14,8 +14,10 @@ import {
   clearVerifiedTxsForUser,
   getChatMessagesForUser,
   getVerificationRunsForUser,
-  getVerifiedTxsForUser,
+  getVerifiedTxsByHashes,
+  getVerifiedTxsForUsers,
   getWorkspaceForUser,
+  purgePartialVerifiedTxsForUsers,
   saveVerificationRunForUser,
   upsertVerifiedTxsForUser,
   upsertWorkspaceForUser,
@@ -247,6 +249,112 @@ async function resolveOptionalUserId(req: Request): Promise<number | null> {
   }
 }
 
+const GLOBAL_VERIFIED_CACHE_UID = '__global_verified_cache__';
+const GLOBAL_VERIFIED_CACHE_EMAIL = 'verified-cache@system.local';
+
+async function resolveCacheUserIds(req: Request): Promise<number[]> {
+  const [optionalUserId, globalUser] = await Promise.all([
+    resolveOptionalUserId(req),
+    getOrCreateUser(GLOBAL_VERIFIED_CACHE_UID, GLOBAL_VERIFIED_CACHE_EMAIL),
+  ]);
+  if (optionalUserId !== null && optionalUserId !== globalUser.id) {
+    return [optionalUserId, globalUser.id];
+  }
+  return [globalUser.id];
+}
+
+function isValidPayloadJsonRecord(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  const p = payload as Record<string, unknown>;
+  const rel = p.reliability as Record<string, unknown> | undefined;
+  if (rel?.tier === 'partial') return false;
+  if (p.errorReason) return false;
+
+  const finality = String(p.finality || '');
+  if (
+    finality === 'rpc_error' ||
+    finality === 'not_found' ||
+    finality === 'invalid'
+  ) {
+    return false;
+  }
+
+  const execStatus = String(p.executionStatus || '');
+  if (execStatus === 'unknown' || execStatus === 'pending') {
+    return false;
+  }
+
+  const caveat = typeof rel?.caveat === 'string' ? rel.caveat : '';
+  const hasWithdrawalSignal = Boolean(
+    p.withdrawal ||
+      p.hasWithdrawalLog === true ||
+      caveat.includes('L2ToL1MessagePasser') ||
+      caveat.includes('OptimismPortal2')
+  );
+
+  if (hasWithdrawalSignal) {
+    const w = p.withdrawal as Record<string, unknown> | null | undefined;
+    if (!w || typeof w !== 'object') return false;
+    if (!w.validation || typeof w.validation !== 'object') return false;
+    if (w.usedFallbackDelay === true) return false;
+    const val = w.validation as Record<string, unknown>;
+    if (w.portalFinalized !== true && val.portalTopLevelFinalizePassed === undefined) {
+      return false;
+    }
+    if (
+      w.portalFinalized !== true &&
+      (val.recipientBalanceIncreased === false ||
+        val.outerPortalRelaySimulated === false) &&
+      val.canWithdrawAfterWait === true
+    ) {
+      return false;
+    }
+    const wData = typeof w.data === 'string' ? w.data.toLowerCase() : '';
+    if (
+      wData.startsWith('0xd764ad0b') &&
+      (!Array.isArray(val.cdmHops) || val.cdmHops.length === 0)
+    ) {
+      return false;
+    }
+    const recipLower =
+      typeof w.l1Recipient === 'string' ? w.l1Recipient.toLowerCase() : '';
+    if (
+      w.assetType === 'MESSAGE' &&
+      (recipLower === '0x866e82a600a1414e583f7f13623f1ac5d58b0afa' ||
+        recipLower === '0x58cc85b8d04ea49cc6dbad3fbffd00fb78839fc9')
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function isValidDbTxInput(item: VerifiedTxInput): boolean {
+  if (!item || typeof item !== 'object') return false;
+  if (typeof item.txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(item.txHash)) {
+    return false;
+  }
+  if (item.reliabilityTier === 'partial') return false;
+  if (
+    item.finality === 'rpc_error' ||
+    item.finality === 'not_found' ||
+    item.finality === 'invalid'
+  ) {
+    return false;
+  }
+  if (
+    item.executionStatus === 'unknown' ||
+    item.executionStatus === 'pending'
+  ) {
+    return false;
+  }
+  if (item.isWithdrawal && !(item.payloadJson as Record<string, unknown>)?.withdrawal) {
+    return false;
+  }
+  return isValidPayloadJsonRecord(item.payloadJson);
+}
+
 async function startServer() {
   const app = express();
   const port = Number(process.env.PORT || 3000);
@@ -403,13 +511,24 @@ async function startServer() {
     });
   });
 
-  app.get('/api/tx-cache', requireAuth, async (req: AuthRequest, res: Response) => {
+  app.get('/api/tx-cache', async (req: Request, res: Response) => {
     try {
       const networkId = String(req.query.networkId || 'base-mainnet');
       const chainId = Number(req.query.chainId || 8453);
-      const rows = await getVerifiedTxsForUser(req.dbUserId!, networkId, chainId);
+      const userIds = await resolveCacheUserIds(req);
+      await purgePartialVerifiedTxsForUsers(userIds);
+      const rows = await getVerifiedTxsForUsers(userIds, networkId, chainId);
+      const seen = new Set<string>();
+      const cleanPayloads: Array<Record<string, unknown>> = [];
+      for (const r of rows) {
+        const key = r.txHash.toLowerCase();
+        if (seen.has(key)) continue;
+        if (!isValidPayloadJsonRecord(r.payloadJson)) continue;
+        seen.add(key);
+        cleanPayloads.push(r.payloadJson);
+      }
       res.json({
-        items: rows.map((r) => r.payloadJson),
+        items: cleanPayloads,
       });
     } catch (error) {
       console.error('GET /api/tx-cache failed:', error);
@@ -417,23 +536,75 @@ async function startServer() {
     }
   });
 
-  app.post('/api/tx-cache', requireAuth, async (req: AuthRequest, res: Response) => {
+  app.post('/api/tx-cache/lookup', async (req: Request, res: Response) => {
+    try {
+      const body = req.body as {
+        networkId?: string;
+        chainId?: number;
+        hashes?: string[];
+      };
+      const networkId = String(body?.networkId || 'base-mainnet');
+      const chainId = Number(body?.chainId || 8453);
+      const hashes = Array.isArray(body?.hashes) ? body.hashes.slice(0, 500) : [];
+      if (hashes.length === 0) {
+        res.json({ items: [] });
+        return;
+      }
+
+      const userIds = await resolveCacheUserIds(req);
+      const rows = await getVerifiedTxsByHashes(
+        userIds,
+        networkId,
+        chainId,
+        hashes
+      );
+      const seen = new Set<string>();
+      const cleanPayloads: Array<Record<string, unknown>> = [];
+      for (const r of rows) {
+        const key = r.txHash.toLowerCase();
+        if (seen.has(key)) continue;
+        if (!isValidPayloadJsonRecord(r.payloadJson)) continue;
+        seen.add(key);
+        cleanPayloads.push(r.payloadJson);
+      }
+      res.json({ items: cleanPayloads });
+    } catch (error) {
+      console.error('POST /api/tx-cache/lookup failed:', error);
+      res.status(500).json({ error: 'Failed to look up saved transactions' });
+    }
+  });
+
+  app.post('/api/tx-cache', async (req: Request, res: Response) => {
     try {
       const body = req.body as { items?: VerifiedTxInput[] };
-      const items = Array.isArray(body?.items) ? body.items.slice(0, 500) : [];
-      const saved = await upsertVerifiedTxsForUser(req.dbUserId!, items);
-      res.json({ savedCount: saved.length });
+      const rawItems = Array.isArray(body?.items) ? body.items.slice(0, 500) : [];
+      const validItems = rawItems.filter(isValidDbTxInput);
+      const userIds = await resolveCacheUserIds(req);
+      await purgePartialVerifiedTxsForUsers(userIds);
+      if (validItems.length === 0) {
+        res.json({ savedCount: 0 });
+        return;
+      }
+      let primarySavedCount = 0;
+      for (let i = 0; i < userIds.length; i += 1) {
+        const saved = await upsertVerifiedTxsForUser(userIds[i], validItems);
+        if (i === 0) primarySavedCount = saved.length;
+      }
+      res.json({ savedCount: primarySavedCount });
     } catch (error) {
       console.error('POST /api/tx-cache failed:', error);
       res.status(500).json({ error: 'Failed to save transactions' });
     }
   });
 
-  app.delete('/api/tx-cache', requireAuth, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/tx-cache', async (req: Request, res: Response) => {
     try {
       const networkId = req.query.networkId ? String(req.query.networkId) : undefined;
       const chainId = req.query.chainId ? Number(req.query.chainId) : undefined;
-      await clearVerifiedTxsForUser(req.dbUserId!, networkId, chainId);
+      const userIds = await resolveCacheUserIds(req);
+      for (const uid of userIds) {
+        await clearVerifiedTxsForUser(uid, networkId, chainId);
+      }
       res.json({ ok: true });
     } catch (error) {
       console.error('DELETE /api/tx-cache failed:', error);

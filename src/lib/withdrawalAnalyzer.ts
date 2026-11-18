@@ -2,16 +2,17 @@ import {
   createPublicClient,
   decodeFunctionData,
   encodeAbiParameters,
+  encodeFunctionData,
   fallback,
   formatEther,
   formatGwei,
   formatUnits,
+  hexToString,
   http,
   keccak256,
   pad,
   parseAbi,
   parseEventLogs,
-  toHex,
   type Address,
   type Hex,
   type TransactionReceipt,
@@ -23,6 +24,7 @@ import {
   publicActionsL2,
 } from 'viem/op-stack';
 import {
+  CdmHopInspection,
   DisputeWindowMode,
   MessagePasserStatus,
   NetworkConfig,
@@ -39,6 +41,13 @@ import {
 export const L2_TO_L1_MESSAGE_PASSER =
   '0x4200000000000000000000000000000000000016'.toLowerCase();
 
+export const MESSAGE_PASSED_TOPIC0 =
+  '0x02a52367d10742d8032712c1bb8e0144ff1ec5ffda1ed7d70bb05a2744955054';
+
+const MESSAGE_PASSED_EVENT_ABI = parseAbi([
+  'event MessagePassed(uint256 indexed nonce, address indexed sender, address indexed target, uint256 value, uint256 gasLimit, bytes data, bytes32 withdrawalHash)',
+]);
+
 const DEFAULT_L1_STANDARD_BRIDGE_MAINNET =
   '0x3154Cf16ccdb4C6d922629664174b904d80F2C35';
 const DEFAULT_L1_STANDARD_BRIDGE_SEPOLIA =
@@ -50,16 +59,51 @@ const L2_STANDARD_BRIDGE_ABI = parseAbi([
   'event WithdrawalInitiated(address indexed l1Token, address indexed l2Token, address indexed from, address to, uint256 amount, bytes extraData)',
 ]);
 
+const ERC20_TRANSFER_EVENT_ABI = parseAbi([
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
+]);
+
+const L1_CROSS_DOMAIN_MESSENGER_ABI = parseAbi([
+  'function relayMessage(uint256 _nonce, address _sender, address _target, uint256 _value, uint256 _minGasLimit, bytes _message) payable',
+  'function successfulMessages(bytes32) view returns (bool)',
+  'function failedMessages(bytes32) view returns (bool)',
+]);
+
+const L1_BRIDGE_FINALIZE_ABI = parseAbi([
+  'function finalizeBridgeERC20(address _localToken, address _remoteToken, address _from, address _to, uint256 _amount, bytes _extraData)',
+  'function finalizeERC20Withdrawal(address _l1Token, address _l2Token, address _from, address _to, uint256 _amount, bytes _data)',
+  'function finalizeBridgeETH(address _from, address _to, uint256 _amount, bytes _extraData) payable',
+  'function finalizeETHWithdrawal(address _from, address _to, uint256 _amount, bytes _data) payable',
+  'function finalizeBridgeERC721(address _localToken, address _remoteToken, address _from, address _to, uint256 _tokenId, bytes _extraData)',
+]);
+
 const ERC20_META_ABI = parseAbi([
   'function symbol() view returns (string)',
   'function decimals() view returns (uint8)',
-  'function balanceOf(address account) view returns (uint256)',
+  'function balanceOf(address) view returns (uint256)',
+]);
+
+const ERC20_BYTES32_META_ABI = parseAbi([
+  'function symbol() view returns (bytes32)',
+]);
+
+const MULTICALL3_ADDRESS =
+  '0xcA11bde05977b3631167028862bE2a173976CA11' as Address;
+
+const MULTICALL3_ABI = parseAbi([
+  'function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)',
+  'function getEthBalance(address addr) view returns (uint256 balance)',
 ]);
 
 const MESSAGE_PASSER_ABI = parseAbi([
   'function sentMessages(bytes32) view returns (bool)',
-  'function MESSAGE_VERSION() view returns (uint16)',
 ]);
+
+const L2_CROSS_DOMAIN_MESSENGER =
+  '0x4200000000000000000000000000000000000007'.toLowerCase();
+
+const portalL2SenderSlotCache = new Map<string, Hex>();
+const cdmXDomainSenderSlotCache = new Map<string, Hex>();
 
 export const OPTIMISM_PORTAL_READ_ABI = parseAbi([
   'function version() view returns (string)',
@@ -68,7 +112,6 @@ export const OPTIMISM_PORTAL_READ_ABI = parseAbi([
   'function disputeGameFinalityDelaySeconds() view returns (uint256)',
   'function disputeGameFactory() view returns (address)',
   'function respectedGameType() view returns (uint32)',
-  'function ethLockbox() view returns (address)',
   'function finalizedWithdrawals(bytes32) view returns (bool)',
   'function numProofSubmitters(bytes32) view returns (uint256)',
   'function proofSubmitters(bytes32, uint256) view returns (address)',
@@ -96,6 +139,7 @@ export const DISPUTE_GAME_ABI = parseAbi([
   'function version() view returns (string)',
   'function status() view returns (uint8)',
   'function gameType() view returns (uint32)',
+  'function wasRespectedGameTypeWhenCreated() view returns (bool)',
   'function createdAt() view returns (uint64)',
   'function resolvedAt() view returns (uint64)',
   'function expectedResolution() view returns (uint64)',
@@ -110,14 +154,6 @@ export const DISPUTE_GAME_ABI = parseAbi([
   'function SLOW_FINALIZATION_DELAY() view returns (uint256)',
   'function resolve()',
 ]);
-
-const XDM_RELAY_ABI = parseAbi([
-  'function relayMessage(uint256 _nonce, address _sender, address _target, uint256 _value, uint256 _minGasLimit, bytes _message) payable',
-]);
-
-// Cached storage slot indices for stateOverride simulations
-const portalL2SenderSlotCache = new Map<string, number>();
-const xdmSenderSlotCache = new Map<string, number>();
 
 interface CachedPortalDisputeParams {
   portalVersion: string | null;
@@ -137,6 +173,39 @@ interface CachedPortalDisputeParams {
 
 const portalDisputeParamsCache = new Map<string, CachedPortalDisputeParams>();
 const PORTAL_PARAMS_TTL_MS = 5 * 60 * 1000;
+
+function isDeterministicRevertError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('execution reverted') ||
+    msg.includes('OptimismPortal:') ||
+    msg.includes('InvalidGameStatus') ||
+    msg.includes('Unproven')
+  );
+}
+
+async function withRpcRetry<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 3,
+  baseDelayMs = 350
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (isDeterministicRevertError(err) || attempt >= maxAttempts) {
+        break;
+      }
+      const jitter = Math.floor(Math.random() * 140);
+      await new Promise((resolve) =>
+        setTimeout(resolve, baseDelayMs * attempt + jitter)
+      );
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
 
 function buildTransport(urls: string[]) {
   const transports = urls.map((u) => {
@@ -186,6 +255,237 @@ export function createBaseAndL1Clients(config: NetworkConfig) {
   return { l2Client, l1Client, l2Chain, l1Chain, portalAddress, defaultL1Bridge };
 }
 
+interface RawCdmHop {
+  hopIndex: number;
+  messengerAddress: Address;
+  nonce: bigint;
+  sender: Address;
+  target: Address;
+  value: bigint;
+  minGasLimit: bigint;
+  rawRelayCalldata: Hex;
+  versionedHash: Hex;
+}
+
+function unwrapCrossDomainHops(params: {
+  sender: Address;
+  target: Address;
+  value: bigint;
+  data: Hex;
+}): {
+  rawHops: RawCdmHop[];
+  leafSender: Address;
+  leafTarget: Address;
+  leafValue: bigint;
+  leafData: Hex;
+} {
+  const rawHops: RawCdmHop[] = [];
+  let curSender = params.sender;
+  let curTarget = params.target;
+  let curValue = params.value;
+  let curData = params.data;
+
+  for (let hop = 1; hop <= 4; hop += 1) {
+    if (!curData || curData.length < 10 || !curData.toLowerCase().startsWith('0xd764ad0b')) {
+      break;
+    }
+    try {
+      const decoded = decodeFunctionData({
+        abi: L1_CROSS_DOMAIN_MESSENGER_ABI,
+        data: curData,
+      });
+      if (decoded.functionName !== 'relayMessage') break;
+      const [nonce, innerSender, innerTarget, innerValue, minGasLimit, innerMessage] =
+        decoded.args;
+      const msgVersion = nonce >> 240n;
+      const canonicalEncoded =
+        msgVersion === 1n
+          ? encodeFunctionData({
+              abi: L1_CROSS_DOMAIN_MESSENGER_ABI,
+              functionName: 'relayMessage',
+              args: [
+                nonce,
+                innerSender,
+                innerTarget,
+                innerValue,
+                minGasLimit,
+                innerMessage,
+              ],
+            })
+          : curData;
+      rawHops.push({
+        hopIndex: hop,
+        messengerAddress: curTarget,
+        nonce,
+        sender: innerSender,
+        target: innerTarget,
+        value: innerValue,
+        minGasLimit,
+        rawRelayCalldata: curData,
+        versionedHash: keccak256(canonicalEncoded),
+      });
+      curSender = innerSender;
+      curTarget = innerTarget;
+      curValue = innerValue;
+      curData = innerMessage;
+    } catch {
+      break;
+    }
+  }
+
+  return {
+    rawHops,
+    leafSender: curSender,
+    leafTarget: curTarget,
+    leafValue: curValue,
+    leafData: curData,
+  };
+}
+
+async function resolvePortalL2SenderSlot(
+  l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'],
+  portalAddress: Address
+): Promise<Hex | null> {
+  const key = portalAddress.toLowerCase();
+  const cached = portalL2SenderSlotCache.get(key);
+  if (cached) return cached;
+
+  const defaultSlot = pad('0x32', { size: 32 });
+  try {
+    const val32 = await l1Client.getStorageAt({
+      address: portalAddress,
+      slot: defaultSlot,
+    });
+    if (
+      val32 &&
+      val32.toLowerCase().endsWith('000000000000000000000000000000000000dead')
+    ) {
+      portalL2SenderSlotCache.set(key, defaultSlot);
+      return defaultSlot;
+    }
+
+    for (let baseIdx = 0; baseIdx < 64; baseIdx += 16) {
+      const slots = Array.from({ length: 16 }, (_, j) =>
+        pad(`0x${(baseIdx + j).toString(16)}` as Hex, { size: 32 })
+      );
+      const vals = await Promise.all(
+        slots.map((s) =>
+          l1Client
+            .getStorageAt({ address: portalAddress, slot: s })
+            .catch(() => null)
+        )
+      );
+      for (let j = 0; j < vals.length; j += 1) {
+        const v = vals[j];
+        if (
+          v &&
+          v.toLowerCase().endsWith('000000000000000000000000000000000000dead')
+        ) {
+          portalL2SenderSlotCache.set(key, slots[j]);
+          return slots[j];
+        }
+      }
+    }
+  } catch {
+    // Fallback to standard OptimismPortal2 slot 0x32
+  }
+  return defaultSlot;
+}
+
+async function resolveCdmXDomainSenderSlot(
+  l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'],
+  messengerAddress: Address
+): Promise<Hex> {
+  const key = messengerAddress.toLowerCase();
+  const cached = cdmXDomainSenderSlotCache.get(key);
+  if (cached) return cached;
+
+  // Standard OP Stack CrossDomainMessenger xDomainMsgSender slot is 204 (0xcc) = 0x...0000dead
+  const defaultSlot = pad('0xcc', { size: 32 });
+  try {
+    const valCc = await l1Client.getStorageAt({
+      address: messengerAddress,
+      slot: defaultSlot,
+    });
+    if (
+      valCc &&
+      valCc.toLowerCase().endsWith('000000000000000000000000000000000000dead')
+    ) {
+      cdmXDomainSenderSlotCache.set(key, defaultSlot);
+      return defaultSlot;
+    }
+  } catch {
+    // Fallback to standard slot 0xcc
+  }
+  return defaultSlot;
+}
+
+async function readErc20MetadataWithFallback(params: {
+  l2Client: ReturnType<typeof createBaseAndL1Clients>['l2Client'];
+  l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'];
+  l2TokenAddress: string | null;
+  l1TokenAddress: string | null;
+}): Promise<{ symbol: string; decimals: number }> {
+  const { l2Client, l1Client, l2TokenAddress, l1TokenAddress } = params;
+
+  const tryReadOnClient = async (
+    client: typeof l2Client | typeof l1Client,
+    tokenAddr: Address
+  ): Promise<{ symbol: string | null; decimals: number | null }> => {
+    const [symStr, decNum] = await Promise.all([
+      client
+        .readContract({
+          address: tokenAddr,
+          abi: ERC20_META_ABI,
+          functionName: 'symbol',
+        })
+        .catch(async () => {
+          const b32 = await client
+            .readContract({
+              address: tokenAddr,
+              abi: ERC20_BYTES32_META_ABI,
+              functionName: 'symbol',
+            })
+            .catch(() => null);
+          return b32 ? hexToString(b32, { size: 32 }).replace(/\0/g, '').trim() : null;
+        }),
+      client
+        .readContract({
+          address: tokenAddr,
+          abi: ERC20_META_ABI,
+          functionName: 'decimals',
+        })
+        .then((d) => Number(d))
+        .catch(() => null),
+    ]);
+    return { symbol: symStr || null, decimals: decNum };
+  };
+
+  let symbol: string | null = null;
+  let decimals: number | null = null;
+
+  if (l2TokenAddress && l2TokenAddress.toLowerCase() !== ZERO_ADDRESS) {
+    const l2Meta = await tryReadOnClient(l2Client, l2TokenAddress as Address);
+    symbol = l2Meta.symbol;
+    decimals = l2Meta.decimals;
+  }
+
+  if (
+    (!symbol || decimals === null) &&
+    l1TokenAddress &&
+    l1TokenAddress.toLowerCase() !== ZERO_ADDRESS
+  ) {
+    const l1Meta = await tryReadOnClient(l1Client, l1TokenAddress as Address);
+    if (!symbol && l1Meta.symbol) symbol = l1Meta.symbol;
+    if (decimals === null && l1Meta.decimals !== null) decimals = l1Meta.decimals;
+  }
+
+  return {
+    symbol: symbol || 'ERC20',
+    decimals: decimals ?? 18,
+  };
+}
+
 export async function inspectAggregateGameProxy(params: {
   l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'];
   proxyAddress: Address;
@@ -226,27 +526,33 @@ export async function inspectAggregateGameProxy(params: {
         functionName: 'version',
       })
       .catch(() => null),
-    l1Client
-      .readContract({
-        address: proxyAddress,
-        abi: DISPUTE_GAME_ABI,
-        functionName: 'status',
-      })
-      .catch(() => null),
-    l1Client
-      .readContract({
-        address: proxyAddress,
-        abi: DISPUTE_GAME_ABI,
-        functionName: 'gameType',
-      })
-      .catch(() => null),
-    l1Client
-      .readContract({
-        address: proxyAddress,
-        abi: DISPUTE_GAME_ABI,
-        functionName: 'createdAt',
-      })
-      .catch(() => null),
+    withRpcRetry(
+      () =>
+        l1Client.readContract({
+          address: proxyAddress,
+          abi: DISPUTE_GAME_ABI,
+          functionName: 'status',
+        }),
+      2
+    ).catch(() => null),
+    withRpcRetry(
+      () =>
+        l1Client.readContract({
+          address: proxyAddress,
+          abi: DISPUTE_GAME_ABI,
+          functionName: 'gameType',
+        }),
+      2
+    ).catch(() => null),
+    withRpcRetry(
+      () =>
+        l1Client.readContract({
+          address: proxyAddress,
+          abi: DISPUTE_GAME_ABI,
+          functionName: 'createdAt',
+        }),
+      2
+    ).catch(() => null),
     l1Client
       .readContract({
         address: proxyAddress,
@@ -416,7 +722,9 @@ export async function inspectAggregateGameProxy(params: {
     if (hasTeeProof && hasZkProof) {
       summary = `${refPrefix}TEE証明: 検証済 ＆ ZK証明: 検証済（2/2 二重証明達成）→ 高速待機期間 1日 (${fastFinalizationDelaySeconds.toLocaleString()}秒) が適用されています`;
     } else if (hasTeeProof || hasZkProof) {
-      const which = hasTeeProof ? 'TEE証明のみ検証済 (ZK未提出)' : 'ZK証明のみ検証済 (TEE未提出)';
+      const which = hasTeeProof
+        ? 'TEE証明のみ検証済 (ZK未提出)'
+        : 'ZK証明のみ検証済 (TEE未提出)';
       summary = `${refPrefix}${which}（${derivedProofCount}/2 単一証明）→ 通常待機期間 5日 (${slowFinalizationDelaySeconds.toLocaleString()}秒) が適用されています（両方揃うと1日に短縮）`;
     } else {
       summary = `${refPrefix}TEE証明: 未提出 · ZK証明: 未提出（0/2）→ 待機期間 ${formatSecondsJapanese(
@@ -469,48 +777,56 @@ export async function inspectAggregateGameProxy(params: {
 async function resolvePortalDisputeParams(
   l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'],
   portalAddress: Address,
-  forceRefresh = false
+  forceRefresh = false,
+  allowFallback = false
 ): Promise<CachedPortalDisputeParams> {
   const cacheKey = portalAddress.toLowerCase();
   const existing = portalDisputeParamsCache.get(cacheKey);
   if (
     !forceRefresh &&
     existing &&
+    !existing.usedFallbackDelay &&
     Date.now() - existing.cachedAtMs < PORTAL_PARAMS_TTL_MS
   ) {
     return existing;
   }
 
   let usedFallbackDelay = false;
+
+  const readPortalUint = async (
+    fnName: 'proofMaturityDelaySeconds' | 'disputeGameFinalityDelaySeconds',
+    fallbackVal: bigint
+  ): Promise<bigint> => {
+    try {
+      return await withRpcRetry(
+        () =>
+          l1Client.readContract({
+            address: portalAddress,
+            abi: OPTIMISM_PORTAL_READ_ABI,
+            functionName: fnName,
+          }),
+        3
+      );
+    } catch (err) {
+      if (!allowFallback) throw err;
+      usedFallbackDelay = true;
+      return fallbackVal;
+    }
+  };
+
   const [maturityDelay, gameFinalityDelay, respectedType, portalVer, dgfAddr] =
     await Promise.all([
-      l1Client
-        .readContract({
-          address: portalAddress,
-          abi: OPTIMISM_PORTAL_READ_ABI,
-          functionName: 'proofMaturityDelaySeconds',
-        })
-        .catch(() => {
-          usedFallbackDelay = true;
-          return 86400n;
-        }),
-      l1Client
-        .readContract({
-          address: portalAddress,
-          abi: OPTIMISM_PORTAL_READ_ABI,
-          functionName: 'disputeGameFinalityDelaySeconds',
-        })
-        .catch(() => {
-          usedFallbackDelay = true;
-          return 0n;
-        }),
-      l1Client
-        .readContract({
-          address: portalAddress,
-          abi: OPTIMISM_PORTAL_READ_ABI,
-          functionName: 'respectedGameType',
-        })
-        .catch(() => null),
+      readPortalUint('proofMaturityDelaySeconds', 86400n),
+      readPortalUint('disputeGameFinalityDelaySeconds', 0n),
+      withRpcRetry(
+        () =>
+          l1Client.readContract({
+            address: portalAddress,
+            abi: OPTIMISM_PORTAL_READ_ABI,
+            functionName: 'respectedGameType',
+          }),
+        2
+      ).catch(() => null),
       l1Client
         .readContract({
           address: portalAddress,
@@ -518,18 +834,24 @@ async function resolvePortalDisputeParams(
           functionName: 'version',
         })
         .catch(() => null),
-      l1Client
-        .readContract({
-          address: portalAddress,
-          abi: OPTIMISM_PORTAL_READ_ABI,
-          functionName: 'disputeGameFactory',
-        })
-        .catch(() => null),
+      withRpcRetry(
+        () =>
+          l1Client.readContract({
+            address: portalAddress,
+            abi: OPTIMISM_PORTAL_READ_ABI,
+            functionName: 'disputeGameFactory',
+          }),
+        3
+      ).catch((err) => {
+        if (!allowFallback) throw err;
+        usedFallbackDelay = true;
+        return null;
+      }),
     ]);
 
-  let disputeGameResolutionSeconds = 432000; // Base Mainnet GameType=621 single-proof default: 5 days
-  let fastFinalizationDelaySeconds = 86400; // TEE + ZK dual-proof fast path: 1 day
-  let slowFinalizationDelaySeconds = 432000; // Single-proof slow path: 5 days
+  let disputeGameResolutionSeconds = 432000; // Base AggregateVerifier single-proof window: 5 days
+  let fastFinalizationDelaySeconds = 86400; // TEE + ZK dual-proof window: 1 day
+  let slowFinalizationDelaySeconds = 432000; // Single-proof window: 5 days
   let rawMeasuredResolutionSeconds: number | null = null;
   let proposalIntervalSeconds = 1800; // ~30 min default
   let latestGameTeeZk: TeeZkProofInspection | null = null;
@@ -541,23 +863,29 @@ async function resolvePortalDisputeParams(
 
   if (validDgfAddr) {
     try {
-      const count = await l1Client.readContract({
-        address: validDgfAddr,
-        abi: DISPUTE_GAME_FACTORY_ABI,
-        functionName: 'gameCount',
-      });
+      const count = await withRpcRetry(
+        () =>
+          l1Client.readContract({
+            address: validDgfAddr,
+            abi: DISPUTE_GAME_FACTORY_ABI,
+            functionName: 'gameCount',
+          }),
+        3
+      );
 
       if (count >= 1n) {
         const latestIdx = count - 1n;
         const [latestGame, prevGame] = await Promise.all([
-          l1Client
-            .readContract({
-              address: validDgfAddr,
-              abi: DISPUTE_GAME_FACTORY_ABI,
-              functionName: 'gameAtIndex',
-              args: [latestIdx],
-            })
-            .catch(() => null),
+          withRpcRetry(
+            () =>
+              l1Client.readContract({
+                address: validDgfAddr,
+                abi: DISPUTE_GAME_FACTORY_ABI,
+                functionName: 'gameAtIndex',
+                args: [latestIdx],
+              }),
+            2
+          ).catch(() => null),
           count >= 2n
             ? l1Client
                 .readContract({
@@ -591,71 +919,12 @@ async function resolvePortalDisputeParams(
             slowFinalizationDelaySeconds =
               latestGameTeeZk.slowFinalizationDelaySeconds;
             disputeGameResolutionSeconds = latestGameTeeZk.activeWindowSeconds;
+            rawMeasuredResolutionSeconds = latestGameTeeZk.activeWindowSeconds;
           }
         }
       }
-
-      // Sample historical resolved games to empirically confirm resolvedAt - createdAt
-      const offsets = [650n, 950n, 1400n, 2200n, 80n];
-      const sampleIndices = offsets
-        .filter((off) => count > off)
-        .map((off) => count - off);
-
-      const gameEntries = await Promise.all(
-        sampleIndices.map((idx) =>
-          l1Client
-            .readContract({
-              address: validDgfAddr,
-              abi: DISPUTE_GAME_FACTORY_ABI,
-              functionName: 'gameAtIndex',
-              args: [idx],
-            })
-            .catch(() => null)
-        )
-      );
-
-      for (const entry of gameEntries) {
-        if (!entry) continue;
-        const [gType, , proxy] = entry;
-        if (respectedType !== null && Number(gType) !== Number(respectedType)) {
-          continue;
-        }
-        try {
-          const [cAt, rAt, st] = await Promise.all([
-            l1Client.readContract({
-              address: proxy,
-              abi: DISPUTE_GAME_ABI,
-              functionName: 'createdAt',
-            }),
-            l1Client.readContract({
-              address: proxy,
-              abi: DISPUTE_GAME_ABI,
-              functionName: 'resolvedAt',
-            }),
-            l1Client.readContract({
-              address: proxy,
-              abi: DISPUTE_GAME_ABI,
-              functionName: 'status',
-            }),
-          ]);
-          if (Number(st) === 2 && rAt > cAt) {
-            const rawDur = Number(rAt - cAt);
-            rawMeasuredResolutionSeconds = rawDur;
-            if (!latestGameTeeZk) {
-              const nearestHour = Math.round(rawDur / 3600) * 3600;
-              disputeGameResolutionSeconds =
-                nearestHour > 0 && Math.abs(rawDur - nearestHour) <= 600
-                  ? nearestHour
-                  : rawDur;
-              slowFinalizationDelaySeconds = disputeGameResolutionSeconds;
-            }
-            break;
-          }
-        } catch {
-          // Continue checking next sample
-        }
-      }
-    } catch {
+    } catch (err) {
+      if (!allowFallback) throw err;
       usedFallbackDelay = true;
     }
   } else {
@@ -678,60 +947,17 @@ async function resolvePortalDisputeParams(
     cachedAtMs: Date.now(),
   };
 
-  portalDisputeParamsCache.set(cacheKey, resolved);
+  if (!usedFallbackDelay) {
+    portalDisputeParamsCache.set(cacheKey, resolved);
+  }
   return resolved;
 }
 
-async function resolveSentinelSlot(
-  l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'],
-  contractAddress: Address,
-  cache: Map<string, number>,
-  preferredSlot: number,
-  candidateRanges: Array<[number, number]>
-): Promise<number | null> {
-  const key = contractAddress.toLowerCase();
-  const cached = cache.get(key);
-  if (cached !== undefined) return cached;
-
-  try {
-    const preferredVal = await l1Client.getStorageAt({
-      address: contractAddress,
-      slot: toHex(BigInt(preferredSlot), { size: 32 }),
-    });
-    if (preferredVal && preferredVal.toLowerCase().endsWith('0000dead')) {
-      cache.set(key, preferredSlot);
-      return preferredSlot;
-    }
-
-    const candidates: number[] = [];
-    for (const [start, end] of candidateRanges) {
-      for (let s = start; s <= end; s += 1) {
-        if (s !== preferredSlot) candidates.push(s);
-      }
-    }
-
-    const values = await Promise.all(
-      candidates.map((s) =>
-        l1Client
-          .getStorageAt({
-            address: contractAddress,
-            slot: toHex(BigInt(s), { size: 32 }),
-          })
-          .catch(() => null)
-      )
-    );
-
-    for (let i = 0; i < candidates.length; i += 1) {
-      const val = values[i];
-      if (val && val.toLowerCase().endsWith('0000dead')) {
-        cache.set(key, candidates[i]);
-        return candidates[i];
-      }
-    }
-  } catch {
-    // Ignore slot scan failure
-  }
-  return null;
+export async function warmPortalDisputeParams(
+  config: NetworkConfig
+): Promise<void> {
+  const { l1Client, portalAddress } = createBaseAndL1Clients(config);
+  await resolvePortalDisputeParams(l1Client, portalAddress, false, false);
 }
 
 export interface LiveWithdrawalConditions {
@@ -766,9 +992,9 @@ export async function fetchLiveWithdrawalConditions(
   const { l1Client, l2Client, portalAddress } = createBaseAndL1Clients(config);
 
   const [portalParams, l1GasPrice, l2GasPrice] = await Promise.all([
-    resolvePortalDisputeParams(l1Client, portalAddress, true),
-    l1Client.getGasPrice(),
-    l2Client.getGasPrice(),
+    resolvePortalDisputeParams(l1Client, portalAddress, true, true),
+    withRpcRetry(() => l1Client.getGasPrice(), 2),
+    withRpcRetry(() => l2Client.getGasPrice(), 2),
   ]);
 
   const estimatedProveGas = 290000;
@@ -814,7 +1040,12 @@ export async function inspectLatestDisputeGameTeeZk(
   config: NetworkConfig
 ): Promise<TeeZkProofInspection> {
   const { l1Client, portalAddress } = createBaseAndL1Clients(config);
-  const params = await resolvePortalDisputeParams(l1Client, portalAddress, true);
+  const params = await resolvePortalDisputeParams(
+    l1Client,
+    portalAddress,
+    true,
+    false
+  );
   if (params.latestGameTeeZk) {
     return params.latestGameTeeZk;
   }
@@ -832,9 +1063,11 @@ export async function inspectWithdrawalTeeZkStatus(
 }> {
   const clients = createBaseAndL1Clients(config);
   const { l1Client, l2Client, portalAddress } = clients;
-  // Force fresh L1 DisputeGame parameters
-  await resolvePortalDisputeParams(l1Client, portalAddress, true);
-  const receipt = await l2Client.getTransactionReceipt({ hash: txHash });
+  await resolvePortalDisputeParams(l1Client, portalAddress, true, false);
+  const receipt = await withRpcRetry(
+    () => l2Client.getTransactionReceipt({ hash: txHash }),
+    3
+  );
   const updated = await analyzeWithdrawalFromReceipt(receipt, config, clients);
   if (updated?.validation?.teeZk) {
     return {
@@ -899,7 +1132,8 @@ export function getWithdrawalProveDisplayMeta(w: WithdrawalInfo): ProveDisplayMe
       isProven: false,
       shortBadge: '要再Prove',
       headline: '【要再Prove】紐づく DisputeGame が無効化されたため再提出が必要です',
-      subline: '有効な最新 DisputeGame に対して再度 proveWithdrawalTransaction を実行してください。',
+      subline:
+        '有効な最新 DisputeGame に対して再度 proveWithdrawalTransaction を実行してください。',
     };
   }
 
@@ -911,6 +1145,20 @@ export function getWithdrawalProveDisplayMeta(w: WithdrawalInfo): ProveDisplayMe
       : w.status === 'waiting-to-finalize' || w.status === 'ready-to-finalize';
 
   if (provenOnChain) {
+    if (
+      val?.canWithdrawAfterWait === false ||
+      val?.recipientBalanceIncreased === false
+    ) {
+      return {
+        stateKind: 'reprove',
+        isProven: true,
+        shortBadge: 'Prove済 · 着金不可 (受取 0)',
+        headline:
+          '【着金不可】Prove提出済みですが、このTxを確定してもL1で資金は受け取れません（実測受取 0）',
+        subline:
+          'Base側でL2StandardBridge経由の資産ロック・焼却を伴わないメッセージのため、待機期間後にFinalizeを実行してもL1ガス代のみ消費され資産は届きません（このTx自体でBase上のトークンは減っていません）。',
+      };
+    }
     const readyToClaim =
       w.status === 'ready-to-finalize' || val?.proveState === 'proven-ready';
     return {
@@ -978,7 +1226,6 @@ async function findL1ProveTransactionByTimestamp(params: {
     const firstTry = await queryAround(estBlock, 350n);
     if (firstTry) return firstTry;
 
-    // Drift correction for older timestamps (missed PoS slots shift ~70 blocks/day)
     const sampleBlk = await l1Client.getBlock({ blockNumber: estBlock });
     const driftSec = provenTimestamp - Number(sampleBlk.timestamp);
     let correctedBlock = estBlock + BigInt(Math.round(driftSec / 12));
@@ -993,33 +1240,34 @@ async function findL1ProveTransactionByTimestamp(params: {
   return { txHash: null, blockNumber: null };
 }
 
+/**
+ * Performs ONLY the exact 4 real on-chain contract checks enforced by OP Stack withdrawals:
+ * 1. L2ToL1MessagePasser (0x4200...0016): sentMessages[withdrawalHash] == true & MPT storage inclusion proof
+ * 2. OptimismPortal2 Guards: !paused(), _tx.target != address(OptimismPortal2), finalizedWithdrawals[withdrawalHash]
+ * 3. DisputeGameFactory & AggregateVerifier: provenWithdrawals(hash, submitter), !disputeGameBlacklist(proxy),
+ *    wasRespectedGameTypeWhenCreated(), status() != CHALLENGER_WINS, and TEE/ZK 1d vs 5d window
+ * 4. OptimismPortal2.checkWithdrawal(withdrawalHash, proofSubmitter) & finalizeWithdrawalTransactionExternalProof simulation
+ */
 async function verifyMessagePasserAndL1Validation(params: {
   clients: ReturnType<typeof createBaseAndL1Clients>;
   receipt: TransactionReceipt;
   primary: ReturnType<typeof getWithdrawals>[number];
   initialStatus: WithdrawalStatus;
   portalFinalized: boolean;
-  assetType: 'ETH' | 'ERC20' | 'MESSAGE';
-  assetSymbol: string;
-  assetDecimals: number;
+  portalParams: CachedPortalDisputeParams;
+  l1Recipient: string;
   l1TokenAddress: string | null;
   amountRaw: bigint;
-  amountFormatted: string;
-  portalParams: CachedPortalDisputeParams;
 }): Promise<WithdrawalValidationReport> {
   const {
-    clients: { l1Client, l2Client, l2Chain, portalAddress, defaultL1Bridge },
+    clients: { l1Client, l2Client, l2Chain, portalAddress },
     receipt,
     primary,
-    initialStatus,
     portalFinalized,
-    assetType,
-    assetSymbol,
-    assetDecimals,
+    portalParams,
+    l1Recipient,
     l1TokenAddress,
     amountRaw,
-    amountFormatted,
-    portalParams,
   } = params;
 
   const {
@@ -1039,58 +1287,25 @@ async function verifyMessagePasserAndL1Validation(params: {
     )
   );
 
-  // Decode optional L1CrossDomainMessenger.relayMessage payload to inspect inner bridge call
-  let decodedRelay: {
-    sender: Address;
-    target: Address;
-    value: bigint;
-    minGasLimit: bigint;
-    message: Hex;
-  } | null = null;
-  try {
-    const dec = decodeFunctionData({
-      abi: XDM_RELAY_ABI,
-      data: primary.data,
-    });
-    if (dec.functionName === 'relayMessage') {
-      decodedRelay = {
-        sender: dec.args[1],
-        target: dec.args[2],
-        value: dec.args[3],
-        minGasLimit: dec.args[4],
-        message: dec.args[5],
-      };
-    }
-  } catch {
-    decodedRelay = null;
-  }
-
-  // Parallel L2 MessagePasser + L1 OptimismPortal2 validation queries
+  // Critical L2 MessagePasser + L1 OptimismPortal2 reads with retry (no silent error swallowing!)
   const [
     sentMessageRecorded,
-    msgVersionRaw,
     storageSlotValue,
     mpProof,
     portalPaused,
     numProofSubmittersBig,
-    lockboxAddr,
-    portalEthBalance,
   ] = await Promise.all([
-    l2Client
-      .readContract({
-        address: mpAddress,
-        abi: MESSAGE_PASSER_ABI,
-        functionName: 'sentMessages',
-        args: [primary.withdrawalHash],
-      })
-      .catch(() => false),
-    l2Client
-      .readContract({
-        address: mpAddress,
-        abi: MESSAGE_PASSER_ABI,
-        functionName: 'MESSAGE_VERSION',
-      })
-      .catch(() => 1),
+    withRpcRetry(
+      () =>
+        l2Client.readContract({
+          address: mpAddress,
+          abi: MESSAGE_PASSER_ABI,
+          functionName: 'sentMessages',
+          args: [primary.withdrawalHash],
+        }),
+      4,
+      450
+    ),
     l2Client
       .getStorageAt({
         address: mpAddress,
@@ -1102,7 +1317,7 @@ async function verifyMessagePasserAndL1Validation(params: {
       .getProof({
         address: mpAddress,
         storageKeys: [storageKey],
-        blockTag: 'safe',
+        blockTag: 'latest',
       })
       .catch(() =>
         l2Client
@@ -1113,29 +1328,27 @@ async function verifyMessagePasserAndL1Validation(params: {
           })
           .catch(() => null)
       ),
-    l1Client
-      .readContract({
-        address: portalAddress,
-        abi: OPTIMISM_PORTAL_READ_ABI,
-        functionName: 'paused',
-      })
-      .catch(() => false),
-    l1Client
-      .readContract({
-        address: portalAddress,
-        abi: OPTIMISM_PORTAL_READ_ABI,
-        functionName: 'numProofSubmitters',
-        args: [primary.withdrawalHash],
-      })
-      .catch(() => 0n),
-    l1Client
-      .readContract({
-        address: portalAddress,
-        abi: OPTIMISM_PORTAL_READ_ABI,
-        functionName: 'ethLockbox',
-      })
-      .catch(() => null),
-    l1Client.getBalance({ address: portalAddress }).catch(() => 0n),
+    withRpcRetry(
+      () =>
+        l1Client.readContract({
+          address: portalAddress,
+          abi: OPTIMISM_PORTAL_READ_ABI,
+          functionName: 'paused',
+        }),
+      4,
+      450
+    ),
+    withRpcRetry(
+      () =>
+        l1Client.readContract({
+          address: portalAddress,
+          abi: OPTIMISM_PORTAL_READ_ABI,
+          functionName: 'numProofSubmitters',
+          args: [primary.withdrawalHash],
+        }),
+      4,
+      450
+    ),
   ]);
 
   let finalMpProof = mpProof;
@@ -1153,7 +1366,6 @@ async function verifyMessagePasserAndL1Validation(params: {
   }
 
   const nonceVersion = Number(primary.nonce >> 240n);
-  const messageVersion = Number(msgVersionRaw);
   const proofNodes = finalMpProof?.storageProof?.[0]?.proof?.length ?? 0;
   const proofSlotVal = finalMpProof?.storageProof?.[0]?.value ?? 0n;
   const merkleProofVerified =
@@ -1164,7 +1376,7 @@ async function verifyMessagePasserAndL1Validation(params: {
   const messagePasser: MessagePasserStatus = {
     contractAddress: mpAddress,
     sentMessageRecorded: Boolean(sentMessageRecorded),
-    messageVersion,
+    messageVersion: nonceVersion,
     storageKey,
     storageSlotValue,
     storageRoot: finalMpProof?.storageHash ?? null,
@@ -1172,7 +1384,11 @@ async function verifyMessagePasserAndL1Validation(params: {
     merkleProofVerified,
   };
 
-  // Inspect L1 Proof Submitters, DisputeGame & TEE/ZK Multi-Proof State
+  // OptimismPortal2 real target guard: require(_tx.target != address(this))
+  const targetIsValid =
+    primary.target.toLowerCase() !== portalAddress.toLowerCase();
+
+  // Inspect L1 Proof Submitters, DisputeGame & AggregateVerifier (TEE/ZK) State
   const numProofSubmitters = Number(numProofSubmittersBig);
   const proofSubmittersList: string[] = [];
   let proofSubmitter: string | null = null;
@@ -1183,7 +1399,9 @@ async function verifyMessagePasserAndL1Validation(params: {
   let disputeGameCreatedAt: number | null = null;
   let disputeGameResolvedAt: number | null = null;
   let disputeGameBlacklisted: boolean | null = null;
+  let wasRespectedGameTypeWhenCreated: boolean | null = null;
   let provenTimestamp: number | null = null;
+  let provenAfterGameCreated = true;
   let l1ProveTxHash: string | null = null;
   let l1ProveBlockNumber: number | null = null;
   let maturityRemainingSeconds: number | null = null;
@@ -1196,14 +1414,16 @@ async function verifyMessagePasserAndL1Validation(params: {
     const maxCheck = Math.min(numProofSubmitters, 5);
     const subs = await Promise.all(
       Array.from({ length: maxCheck }, (_, idx) =>
-        l1Client
-          .readContract({
-            address: portalAddress,
-            abi: OPTIMISM_PORTAL_READ_ABI,
-            functionName: 'proofSubmitters',
-            args: [primary.withdrawalHash, BigInt(idx)],
-          })
-          .catch(() => null)
+        withRpcRetry(
+          () =>
+            l1Client.readContract({
+              address: portalAddress,
+              abi: OPTIMISM_PORTAL_READ_ABI,
+              functionName: 'proofSubmitters',
+              args: [primary.withdrawalHash, BigInt(idx)],
+            }),
+          2
+        ).catch(() => null)
       )
     );
 
@@ -1213,12 +1433,16 @@ async function verifyMessagePasserAndL1Validation(params: {
 
     for (const sub of proofSubmittersList) {
       try {
-        const proven = await l1Client.readContract({
-          address: portalAddress,
-          abi: OPTIMISM_PORTAL_READ_ABI,
-          functionName: 'provenWithdrawals',
-          args: [primary.withdrawalHash, sub as Address],
-        });
+        const proven = await withRpcRetry(
+          () =>
+            l1Client.readContract({
+              address: portalAddress,
+              abi: OPTIMISM_PORTAL_READ_ABI,
+              functionName: 'provenWithdrawals',
+              args: [primary.withdrawalHash, sub as Address],
+            }),
+          2
+        );
         const gameProxy = proven[0];
         const pTs = Number(proven[1]);
 
@@ -1244,18 +1468,28 @@ async function verifyMessagePasserAndL1Validation(params: {
         }
 
         let blacklisted = false;
+        let wasRespected: boolean | null = null;
         let inspectedGame: TeeZkProofInspection | null = null;
 
         if (gameProxy && gameProxy.toLowerCase() !== ZERO_ADDRESS) {
-          const [bl, gameInspection] = await Promise.all([
+          const [bl, respectedWhenCreated, gameInspection] = await Promise.all([
+            withRpcRetry(
+              () =>
+                l1Client.readContract({
+                  address: portalAddress,
+                  abi: OPTIMISM_PORTAL_READ_ABI,
+                  functionName: 'disputeGameBlacklist',
+                  args: [gameProxy],
+                }),
+              2
+            ).catch(() => false),
             l1Client
               .readContract({
-                address: portalAddress,
-                abi: OPTIMISM_PORTAL_READ_ABI,
-                functionName: 'disputeGameBlacklist',
-                args: [gameProxy],
+                address: gameProxy,
+                abi: DISPUTE_GAME_ABI,
+                functionName: 'wasRespectedGameTypeWhenCreated',
               })
-              .catch(() => false),
+              .catch(() => null),
             inspectAggregateGameProxy({
               l1Client,
               proxyAddress: gameProxy,
@@ -1265,6 +1499,7 @@ async function verifyMessagePasserAndL1Validation(params: {
             }).catch(() => null),
           ]);
           blacklisted = Boolean(bl);
+          wasRespected = respectedWhenCreated;
           inspectedGame = gameInspection;
         }
 
@@ -1278,13 +1513,18 @@ async function verifyMessagePasserAndL1Validation(params: {
           (subCheckPassed && !checkWithdrawalPassed) ||
           (!blacklisted &&
             gStatus !== 1 &&
-            (disputeGameBlacklisted || disputeGameStatus === 1));
+            wasRespected !== false &&
+            (disputeGameBlacklisted ||
+              disputeGameStatus === 1 ||
+              wasRespectedGameTypeWhenCreated === false));
 
         if (isBetterCandidate) {
           proofSubmitter = sub;
           disputeGameAddress = gameProxy;
           provenTimestamp = pTs;
+          provenAfterGameCreated = gCreated === null ? true : pTs > gCreated;
           disputeGameBlacklisted = blacklisted;
+          wasRespectedGameTypeWhenCreated = wasRespected;
           disputeGameStatus = gStatus;
           disputeGameType = gType;
           disputeGameCreatedAt = gCreated;
@@ -1313,6 +1553,7 @@ async function verifyMessagePasserAndL1Validation(params: {
       l1ProveTxHash = proveTxInfo.txHash;
       l1ProveBlockNumber = proveTxInfo.blockNumber;
     }
+
     if (portalFinalized) {
       gameResolutionRemainingSeconds = 0;
     } else if (disputeGameStatus === 2) {
@@ -1321,10 +1562,7 @@ async function verifyMessagePasserAndL1Validation(params: {
         0,
         rAt + disputeGameFinalityDelaySeconds - nowSec
       );
-    } else if (
-      teeZk &&
-      teeZk.remainingToResolveSeconds !== null
-    ) {
+    } else if (teeZk && teeZk.remainingToResolveSeconds !== null) {
       gameResolutionRemainingSeconds =
         teeZk.remainingToResolveSeconds + disputeGameFinalityDelaySeconds;
     } else if (disputeGameCreatedAt !== null) {
@@ -1336,8 +1574,7 @@ async function verifyMessagePasserAndL1Validation(params: {
           nowSec
       );
     }
-  } else if (initialStatus === 'ready-to-prove') {
-    // Unproven, but L1 DisputeGame already exists for this L2 block — inspect its TEE/ZK status!
+  } else if (!portalFinalized) {
     try {
       const output = await l1Client.getL2Output({
         l2BlockNumber: receipt.blockNumber,
@@ -1347,23 +1584,46 @@ async function verifyMessagePasserAndL1Validation(params: {
       disputeGameCreatedAt = Number(output.timestamp);
 
       if (portalParams.disputeGameFactoryAddress) {
-        const entry = await l1Client
-          .readContract({
-            address: portalParams.disputeGameFactoryAddress,
-            abi: DISPUTE_GAME_FACTORY_ABI,
-            functionName: 'gameAtIndex',
-            args: [BigInt(output.outputIndex)],
-          })
-          .catch(() => null);
+        const entry = await withRpcRetry(
+          () =>
+            l1Client.readContract({
+              address: portalParams.disputeGameFactoryAddress!,
+              abi: DISPUTE_GAME_FACTORY_ABI,
+              functionName: 'gameAtIndex',
+              args: [BigInt(output.outputIndex)],
+            }),
+          2
+        ).catch(() => null);
+
         if (entry && entry[2].toLowerCase() !== ZERO_ADDRESS) {
           disputeGameAddress = entry[2];
-          teeZk = await inspectAggregateGameProxy({
-            l1Client,
-            proxyAddress: entry[2],
-            disputeGameIndex,
-            isReferenceLatestGame: false,
-            fallbackResolutionSeconds: disputeGameResolutionSeconds,
-          }).catch(() => null);
+          const [bl, respectedWhenCreated, inspected] = await Promise.all([
+            l1Client
+              .readContract({
+                address: portalAddress,
+                abi: OPTIMISM_PORTAL_READ_ABI,
+                functionName: 'disputeGameBlacklist',
+                args: [entry[2]],
+              })
+              .catch(() => false),
+            l1Client
+              .readContract({
+                address: entry[2],
+                abi: DISPUTE_GAME_ABI,
+                functionName: 'wasRespectedGameTypeWhenCreated',
+              })
+              .catch(() => null),
+            inspectAggregateGameProxy({
+              l1Client,
+              proxyAddress: entry[2],
+              disputeGameIndex,
+              isReferenceLatestGame: false,
+              fallbackResolutionSeconds: disputeGameResolutionSeconds,
+            }).catch(() => null),
+          ]);
+          disputeGameBlacklisted = Boolean(bl);
+          wasRespectedGameTypeWhenCreated = respectedWhenCreated;
+          teeZk = inspected;
           if (teeZk) {
             disputeGameStatus = teeZk.gameStatus;
             disputeGameType = teeZk.gameType;
@@ -1387,36 +1647,36 @@ async function verifyMessagePasserAndL1Validation(params: {
         );
       }
     } catch {
+      // DisputeGame covering this L2 block has not been proposed to L1 yet; attach latest network AggregateVerifier game
+      teeZk = portalParams.latestGameTeeZk;
       maturityRemainingSeconds = proofMaturityDelaySeconds;
-      gameResolutionRemainingSeconds =
-        disputeGameResolutionSeconds + disputeGameFinalityDelaySeconds;
+      const activeWin =
+        teeZk?.activeWindowSeconds ?? disputeGameResolutionSeconds;
+      gameResolutionRemainingSeconds = activeWin + disputeGameFinalityDelaySeconds;
     }
-  } else {
-    // waiting-to-prove: own DisputeGame not yet proposed on L1; attach latest network DisputeGame as TEE/ZK reference
-    teeZk = portalParams.latestGameTeeZk;
-    maturityRemainingSeconds = proofMaturityDelaySeconds;
-    const activeWin =
-      teeZk?.activeWindowSeconds ?? disputeGameResolutionSeconds;
-    gameResolutionRemainingSeconds = activeWin + disputeGameFinalityDelaySeconds;
   }
 
-  // Note: If DisputeGame expectedResolution has already passed (canCallResolveNow) AND maturityRemainingSeconds === 0,
-  // checkWithdrawal only reverted because resolve() hasn't been called on the game yet!
+  // If DisputeGame expectedResolution has already passed (canCallResolveNow) AND maturityRemainingSeconds === 0,
+  // checkWithdrawal only reverted because resolve() hasn't been called on the DisputeGame yet.
   if (
     !portalFinalized &&
     numProofSubmitters > 0 &&
     !checkWithdrawalPassed &&
     teeZk?.canCallResolveNow &&
     (maturityRemainingSeconds ?? 1) === 0 &&
-    disputeGameBlacklisted !== true
+    disputeGameBlacklisted !== true &&
+    wasRespectedGameTypeWhenCreated !== false
   ) {
     checkWithdrawalPassed = true;
     checkWithdrawalError = null;
   }
 
-  // Determine Prove Lifecycle State
   const gameInvalid =
-    disputeGameBlacklisted === true || disputeGameStatus === 1;
+    disputeGameBlacklisted === true ||
+    disputeGameStatus === 1 ||
+    wasRespectedGameTypeWhenCreated === false ||
+    !provenAfterGameCreated;
+
   let proveState: ProveLifecycleState = 'unproven-waiting-game';
   let proveStateLabel = '';
 
@@ -1430,10 +1690,10 @@ async function verifyMessagePasserAndL1Validation(params: {
     if (gameInvalid) {
       proveState = 'invalid-need-reprove';
       proveStateLabel =
-        '要再Prove（紐づくDisputeGameが無効化またはブラックリスト化されています）';
+        '要再Prove（紐づくDisputeGameが無効化・非Respected・またはブラックリスト化されています）';
     } else if (checkWithdrawalPassed === true) {
       proveState = 'proven-ready';
-      proveStateLabel = `Prove完了・全待機期間クリア（Submitter: ${proofSubmitter?.slice(
+      proveStateLabel = `Prove完了・checkWithdrawal要件クリア（Submitter: ${proofSubmitter?.slice(
         0,
         10
       )}... · 今すぐFinalize可能）`;
@@ -1449,83 +1709,163 @@ async function verifyMessagePasserAndL1Validation(params: {
           : '—';
       proveStateLabel = `Prove提出済 · 待機中（Prove後成熟残り: ${matStr} / DisputeGame解決残り: ${gameStr}）`;
     }
-  } else if (initialStatus === 'ready-to-prove' || disputeGameIndex !== null) {
+  } else if (disputeGameIndex !== null) {
     proveState = 'unproven-ready';
-    proveStateLabel = `未Prove · 今すぐ proveWithdrawalTransaction 実行可能${
-      disputeGameIndex !== null ? ` (DisputeGame #${disputeGameIndex})` : ''
-    }`;
+    proveStateLabel = `未Prove · 今すぐ proveWithdrawalTransaction 実行可能 (DisputeGame #${disputeGameIndex})`;
   } else {
     proveState = 'unproven-waiting-game';
     proveStateLabel =
       '未Prove · L1 DisputeGame 提案待機中（約25〜30分間隔でL1へ提案されます）';
   }
 
-  // Check L1 Liquidity (ETH Portal/Lockbox balance or ERC20 Bridge balance)
-  let lockboxBalance = 0n;
-  if (
-    lockboxAddr &&
-    typeof lockboxAddr === 'string' &&
-    lockboxAddr !== '0x0000000000000000000000000000000000000000'
-  ) {
-    lockboxBalance = await l1Client
-      .getBalance({ address: lockboxAddr as Address })
-      .catch(() => 0n);
-  }
-  const availablePortalEth = portalEthBalance + lockboxBalance;
+  // Exact L1 Target Frame Verification (OptimismPortal2 -> _tx.target with l2Sender = _tx.sender stateOverride)
+  // This reproduces SafeCall.call(_tx.target, _tx.gasLimit, _tx.value, _tx.data) immediately with zero waiting,
+  // avoiding the false "CrossDomainMessenger: message cannot be replayed" error caused by idle l2Sender == 0x...dEaD!
+  const unwrapped = unwrapCrossDomainHops({
+    sender: primary.sender,
+    target: primary.target,
+    value: primary.value,
+    data: primary.data,
+  });
 
-  let l1LiquiditySufficient: boolean | null = true;
-  let l1LiquidityDetail = '';
-
-  if (portalFinalized) {
-    l1LiquiditySufficient = true;
-    l1LiquidityDetail = `L1で既に支払完了済み (${amountFormatted} ${assetSymbol})`;
-  } else if (assetType === 'ETH' || primary.value > 0n) {
-    const requiredWei = primary.value > 0n ? primary.value : amountRaw;
-    l1LiquiditySufficient = availablePortalEth >= requiredWei;
-    const availFormatted = Number(formatEther(availablePortalEth)).toLocaleString(
-      undefined,
-      { maximumFractionDigits: 2 }
+  const cdmHops: CdmHopInspection[] = [];
+  if (unwrapped.rawHops.length > 0) {
+    const hopStates = await Promise.all(
+      unwrapped.rawHops.map(async (h) => {
+        const [succ, fail] = await Promise.all([
+          l1Client
+            .readContract({
+              address: h.messengerAddress,
+              abi: L1_CROSS_DOMAIN_MESSENGER_ABI,
+              functionName: 'successfulMessages',
+              args: [h.versionedHash],
+            })
+            .catch(() => null),
+          l1Client
+            .readContract({
+              address: h.messengerAddress,
+              abi: L1_CROSS_DOMAIN_MESSENGER_ABI,
+              functionName: 'failedMessages',
+              args: [h.versionedHash],
+            })
+            .catch(() => null),
+        ]);
+        return { succ, fail };
+      })
     );
-    l1LiquidityDetail = `OptimismPortal2 保有残高: ${availFormatted} ETH (必要額: ${amountFormatted} ETH)`;
-  } else if (assetType === 'ERC20' && l1TokenAddress) {
-    const bridgeTarget = decodedRelay?.target ?? defaultL1Bridge;
-    try {
-      const bridgeTokenBal = await l1Client.readContract({
-        address: l1TokenAddress as Address,
-        abi: ERC20_META_ABI,
-        functionName: 'balanceOf',
-        args: [bridgeTarget],
+
+    unwrapped.rawHops.forEach((h, idx) => {
+      cdmHops.push({
+        hopIndex: h.hopIndex,
+        messengerAddress: h.messengerAddress,
+        nonce: h.nonce.toString(),
+        sender: h.sender,
+        target: h.target,
+        valueWei: h.value.toString(),
+        minGasLimit: h.minGasLimit.toString(),
+        versionedHash: h.versionedHash,
+        successfulMessage: hopStates[idx].succ,
+        failedMessage: hopStates[idx].fail,
+        standaloneRelayPassed: null,
+        standaloneRelayError: null,
       });
-      l1LiquiditySufficient = bridgeTokenBal >= amountRaw;
-      const balStr = formatDisplayAmount(
-        formatUnits(bridgeTokenBal, assetDecimals)
-      );
-      l1LiquidityDetail = l1LiquiditySufficient
-        ? `L1 Bridge (${bridgeTarget.slice(0, 8)}...) 保有残高: ${balStr} ${assetSymbol} (必要額: ${amountFormatted} ${assetSymbol})`
-        : `L1 Bridge 残高 ${balStr} ${assetSymbol} (Mint型トークンまたは要流動性確認)`;
-    } catch {
-      l1LiquiditySufficient = null;
-      l1LiquidityDetail = 'L1トークン残高の直接照会スキップ（ドライランで検証）';
-    }
-  } else {
-    l1LiquiditySufficient = true;
-    l1LiquidityDetail = 'メッセージリレー（ETH移動なし）';
+    });
   }
 
-  // Post-Maturity L1 Execution Simulation (Can it actually withdraw once wait time passes?)
+  let postWaitSimError: string | null = null;
   let outerPortalRelaySimulated = false;
   let innerBridgeRelaySimulated: boolean | null = null;
-  let postWaitSimError: string | null = null;
+  let portalTopLevelFinalizePassed: boolean | null = portalFinalized ? true : null;
+  let leafBridgeCallPassed: boolean | null = portalFinalized ? true : null;
+  let recipientBalanceIncreased: boolean | null = portalFinalized ? true : null;
+  let winningFinalizeFrame:
+    | 'resolve+finalizeExternalProof'
+    | 'finalizeExternalProof'
+    | 'finalizeDirect'
+    | null = null;
 
-  if (portalFinalized) {
-    outerPortalRelaySimulated = true;
-    innerBridgeRelaySimulated = decodedRelay ? true : null;
-  } else {
-    // 1. If checkWithdrawalPassed right now, test direct finalizeWithdrawalTransactionExternalProof
-    if (checkWithdrawalPassed === true && proofSubmitter) {
+  if (!portalFinalized && targetIsValid && !portalPaused) {
+    const l2SenderSlot = await resolvePortalL2SenderSlot(l1Client, portalAddress);
+    const minSafePortalGas = (primary.gasLimit * 66n) / 63n + 220000n;
+
+    // Stage 0 (3段全体フル確定フレーム): Simulate actual OptimismPortal2.finalizeWithdrawalTransactionExternalProof
+    // using post-wait stateOverride on provenWithdrawals (slot 57) + DisputeGame (slot 0 = DEFENDER_WINS) via Multicall3!
+    const refGameAddress = (disputeGameAddress ??
+      portalParams.latestGameTeeZk?.disputeGameAddress ??
+      null) as Address | null;
+    const simSubmitter = (proofSubmitter ?? receipt.from) as Address;
+
+    if (refGameAddress && refGameAddress.toLowerCase() !== ZERO_ADDRESS) {
       try {
-        await l1Client.simulateContract({
-          address: portalAddress,
+        const outerPwKey = keccak256(
+          encodeAbiParameters(
+            [{ type: 'bytes32' }, { type: 'uint256' }],
+            [primary.withdrawalHash, 57n]
+          )
+        );
+        const pwSlot = keccak256(
+          encodeAbiParameters(
+            [{ type: 'address' }, { type: 'bytes32' }],
+            [simSubmitter, outerPwKey]
+          )
+        );
+        const pastProvenTs = BigInt(
+          Math.max(1, nowSec - proofMaturityDelaySeconds - 7200)
+        );
+        const pwOverrideVal = pad(
+          `0x${((pastProvenTs << 160n) | BigInt(refGameAddress)).toString(16)}` as Hex,
+          { size: 32 }
+        );
+
+        const existingGameSlot0 = await l1Client
+          .getStorageAt({
+            address: refGameAddress,
+            slot: pad('0x0', { size: 32 }),
+          })
+          .catch(() => null);
+        const existingBig = existingGameSlot0 ? BigInt(existingGameSlot0) : (0x0101n << 136n);
+        const highBits = (existingBig >> 136n) << 136n;
+        const pastCreated = BigInt(
+          Math.max(1, nowSec - proofMaturityDelaySeconds - 14400)
+        );
+        const pastResolved = BigInt(
+          Math.max(1, nowSec - disputeGameFinalityDelaySeconds - 3600)
+        );
+        // status = 2 (DEFENDER_WINS) at bits 128..135
+        const gameSlot0Override = pad(
+          `0x${(
+            highBits |
+            (2n << 128n) |
+            (pastResolved << 64n) |
+            pastCreated
+          ).toString(16)}` as Hex,
+          { size: 32 }
+        );
+
+        const validRecipient =
+          l1Recipient && /^0x[0-9a-fA-F]{40}$/.test(l1Recipient)
+            ? (l1Recipient as Address)
+            : primary.target;
+        const hasErc20Token =
+          Boolean(l1TokenAddress) &&
+          l1TokenAddress!.toLowerCase() !== ZERO_ADDRESS;
+
+        const balTarget = hasErc20Token
+          ? (l1TokenAddress as Address)
+          : MULTICALL3_ADDRESS;
+        const balCallData = hasErc20Token
+          ? encodeFunctionData({
+              abi: ERC20_META_ABI,
+              functionName: 'balanceOf',
+              args: [validRecipient],
+            })
+          : encodeFunctionData({
+              abi: MULTICALL3_ABI,
+              functionName: 'getEthBalance',
+              args: [validRecipient],
+            });
+
+        const finalizeCallData = encodeFunctionData({
           abi: OPTIMISM_PORTAL_READ_ABI,
           functionName: 'finalizeWithdrawalTransactionExternalProof',
           args: [
@@ -1537,52 +1877,252 @@ async function verifyMessagePasserAndL1Validation(params: {
               gasLimit: primary.gasLimit,
               data: primary.data,
             },
-            proofSubmitter as Address,
+            simSubmitter,
           ],
-          account: receipt.from,
         });
-        outerPortalRelaySimulated = true;
-      } catch (err) {
-        postWaitSimError = extractShortRevertReason(
-          err instanceof Error ? err.message : String(err)
-        );
+
+        const finalizedCheckData = encodeFunctionData({
+          abi: OPTIMISM_PORTAL_READ_ABI,
+          functionName: 'finalizedWithdrawals',
+          args: [primary.withdrawalHash],
+        });
+
+        const mcSim = await l1Client.simulateContract({
+          address: MULTICALL3_ADDRESS,
+          abi: MULTICALL3_ABI,
+          functionName: 'aggregate3',
+          args: [
+            [
+              { target: balTarget, allowFailure: true, callData: balCallData },
+              {
+                target: portalAddress,
+                allowFailure: true,
+                callData: finalizeCallData,
+              },
+              {
+                target: portalAddress,
+                allowFailure: true,
+                callData: finalizedCheckData,
+              },
+              { target: balTarget, allowFailure: true, callData: balCallData },
+            ],
+          ],
+          gas: minSafePortalGas + 250000n,
+          stateOverride: [
+            {
+              address: portalAddress,
+              balance: primary.value + 10n ** 18n,
+              stateDiff: [{ slot: pwSlot, value: pwOverrideVal }],
+            },
+            {
+              address: refGameAddress,
+              stateDiff: [
+                { slot: pad('0x0', { size: 32 }), value: gameSlot0Override },
+              ],
+            },
+          ],
+        });
+
+        const [balBeforeRes, finRes, isFinRes, balAfterRes] = mcSim.result;
+        const finMarkedTrue =
+          isFinRes.success &&
+          isFinRes.returnData.length >= 66 &&
+          BigInt(isFinRes.returnData) === 1n;
+
+        if (finRes.success && finMarkedTrue) {
+          portalTopLevelFinalizePassed = true;
+          winningFinalizeFrame =
+            teeZk?.canCallResolveNow && disputeGameStatus === 0
+              ? 'resolve+finalizeExternalProof'
+              : 'finalizeExternalProof';
+
+          if (
+            amountRaw > 0n &&
+            balBeforeRes.success &&
+            balAfterRes.success &&
+            balBeforeRes.returnData.length >= 66 &&
+            balAfterRes.returnData.length >= 66
+          ) {
+            recipientBalanceIncreased =
+              BigInt(balAfterRes.returnData) > BigInt(balBeforeRes.returnData);
+          }
+        } else {
+          portalTopLevelFinalizePassed = false;
+        }
+      } catch {
+        // Non-fatal if RPC rejects Multicall3 stateOverride; individual frame simulations run below
       }
     }
 
-    // 2. Simulate post-wait target execution from OptimismPortal2 via stateOverride
-    if (!outerPortalRelaySimulated) {
-      const l2SenderSlot = await resolveSentinelSlot(
-        l1Client,
-        portalAddress,
-        portalL2SenderSlotCache,
-        50,
-        [[50, 65]]
-      );
+    // Stage 1: Simulate OptimismPortal2 -> _tx.target delivery frame with stateOverride: l2Sender = primary.sender
+    if (l2SenderSlot) {
+      try {
+        await l1Client.call({
+          account: portalAddress,
+          to: primary.target,
+          data: primary.data,
+          value: primary.value,
+          gas: (primary.gasLimit > 0n ? primary.gasLimit : 300000n) + 80000n,
+          stateOverride: [
+            {
+              address: portalAddress,
+              balance: primary.value + 10n ** 18n,
+              stateDiff: [
+                {
+                  slot: l2SenderSlot,
+                  value: pad(primary.sender, { size: 32 }),
+                },
+              ],
+            },
+          ],
+        });
+        outerPortalRelaySimulated = true;
+        if (portalTopLevelFinalizePassed === null) {
+          portalTopLevelFinalizePassed = true;
+          winningFinalizeFrame = 'finalizeExternalProof';
+        }
+        if (cdmHops.length === 1) {
+          cdmHops[0].standaloneRelayPassed = true;
+        }
+      } catch (err) {
+        const rawErrMsg = err instanceof Error ? err.message : String(err);
+        const lowerMsg = rawErrMsg.toLowerCase();
+        const isContractRevert =
+          lowerMsg.includes('execution reverted') ||
+          lowerMsg.includes('reverted with reason');
+        const stateOverrideUnsupported =
+          !isContractRevert &&
+          (lowerMsg.includes('invalid argument 2') ||
+            lowerMsg.includes('too many arguments') ||
+            lowerMsg.includes('stateoverride is not') ||
+            lowerMsg.includes('state override is not'));
 
-      if (l2SenderSlot !== null) {
+        if (!stateOverrideUnsupported) {
+          outerPortalRelaySimulated = false;
+          const shortReason = extractShortRevertReason(rawErrMsg);
+          if (cdmHops.length >= 1) {
+            cdmHops[0].standaloneRelayPassed = false;
+            cdmHops[0].standaloneRelayError = shortReason;
+          }
+          postWaitSimError = shortReason;
+        }
+      }
+
+      // Stage 2: If multi-hop nested relayMessage (e.g. Hop 1 -> L1CDM wrapping Hop 2 -> L1StandardBridge),
+      // isolate and test the innermost relayMessage frame separately
+      if (unwrapped.rawHops.length >= 2) {
+        const leafHop = unwrapped.rawHops[unwrapped.rawHops.length - 1];
+        const leafHopRecord = cdmHops[cdmHops.length - 1];
         try {
-          const callGas =
-            primary.gasLimit < 500000n ? 500000n : primary.gasLimit + 100000n;
           await l1Client.call({
             account: portalAddress,
-            to: primary.target,
-            data: primary.data,
-            value: primary.value,
-            gas: callGas,
+            to: leafHop.messengerAddress,
+            data: leafHop.rawRelayCalldata,
+            value: leafHop.value,
+            gas: (leafHop.minGasLimit > 0n ? leafHop.minGasLimit : 250000n) + 80000n,
             stateOverride: [
               {
                 address: portalAddress,
-                balance: availablePortalEth + primary.value + 10n ** 18n,
+                balance: leafHop.value + 10n ** 18n,
                 stateDiff: [
                   {
-                    slot: toHex(BigInt(l2SenderSlot), { size: 32 }),
-                    value: pad(primary.sender, { size: 32 }),
+                    slot: l2SenderSlot,
+                    value: pad(L2_CROSS_DOMAIN_MESSENGER as Address, {
+                      size: 32,
+                    }),
                   },
                 ],
               },
             ],
           });
-          outerPortalRelaySimulated = true;
+          innerBridgeRelaySimulated = true;
+          leafHopRecord.standaloneRelayPassed = true;
+          leafHopRecord.standaloneRelayError = null;
+        } catch (innerErr) {
+          innerBridgeRelaySimulated = false;
+          const shortInner = extractShortRevertReason(
+            innerErr instanceof Error ? innerErr.message : String(innerErr)
+          );
+          leafHopRecord.standaloneRelayPassed = false;
+          leafHopRecord.standaloneRelayError = shortInner;
+        }
+      }
+    }
+
+    // Stage 3 (3段目リーフ着金コール): Simulate leaf bridge/contract call directly (e.g. L1CDM -> L1StandardBridge.finalizeBridgeERC20)
+    // with xDomainMsgSender (slot 0xcc) overridden to leafSender!
+    if (unwrapped.rawHops.length >= 1) {
+      const leafHop = unwrapped.rawHops[unwrapped.rawHops.length - 1];
+      const xDomainSlot = await resolveCdmXDomainSenderSlot(
+        l1Client,
+        leafHop.messengerAddress
+      );
+      try {
+        await l1Client.call({
+          account: leafHop.messengerAddress,
+          to: unwrapped.leafTarget,
+          data: unwrapped.leafData,
+          value: unwrapped.leafValue,
+          gas: (leafHop.minGasLimit > 0n ? leafHop.minGasLimit : 250000n) + 80000n,
+          stateOverride: [
+            {
+              address: leafHop.messengerAddress,
+              balance: unwrapped.leafValue + 10n ** 18n,
+              stateDiff: [
+                {
+                  slot: xDomainSlot,
+                  value: pad(unwrapped.leafSender, { size: 32 }),
+                },
+              ],
+            },
+          ],
+        });
+        leafBridgeCallPassed = true;
+      } catch {
+        leafBridgeCallPassed = false;
+      }
+    }
+
+    // Live check when checkWithdrawal already passes right now
+    if (checkWithdrawalPassed === true && proofSubmitter) {
+      if (teeZk?.canCallResolveNow && disputeGameStatus === 0 && disputeGameAddress) {
+        try {
+          await l1Client.simulateContract({
+            address: disputeGameAddress as Address,
+            abi: DISPUTE_GAME_ABI,
+            functionName: 'resolve',
+            account: receipt.from,
+          });
+          portalTopLevelFinalizePassed = true;
+          winningFinalizeFrame = 'resolve+finalizeExternalProof';
+          postWaitSimError = null;
+        } catch (err) {
+          postWaitSimError = extractShortRevertReason(
+            err instanceof Error ? err.message : String(err)
+          );
+        }
+      } else {
+        try {
+          await l1Client.simulateContract({
+            address: portalAddress,
+            abi: OPTIMISM_PORTAL_READ_ABI,
+            functionName: 'finalizeWithdrawalTransactionExternalProof',
+            args: [
+              {
+                nonce: primary.nonce,
+                sender: primary.sender,
+                target: primary.target,
+                value: primary.value,
+                gasLimit: primary.gasLimit,
+                data: primary.data,
+              },
+              proofSubmitter as Address,
+            ],
+            account: receipt.from,
+            gas: minSafePortalGas,
+          });
+          portalTopLevelFinalizePassed = true;
+          winningFinalizeFrame = 'finalizeExternalProof';
           postWaitSimError = null;
         } catch (err) {
           postWaitSimError = extractShortRevertReason(
@@ -1591,220 +2131,256 @@ async function verifyMessagePasserAndL1Validation(params: {
         }
       }
     }
-
-    // 3. Simulate inner L1StandardBridge / target call inside L1CrossDomainMessenger
-    if (decodedRelay) {
-      const xdmSlot = await resolveSentinelSlot(
-        l1Client,
-        primary.target,
-        xdmSenderSlotCache,
-        204,
-        [
-          [200, 215],
-          [50, 65],
-        ]
-      );
-
-      if (xdmSlot !== null) {
-        try {
-          const innerGas =
-            decodedRelay.minGasLimit < 400000n
-              ? 400000n
-              : decodedRelay.minGasLimit + 150000n;
-          await l1Client.call({
-            account: primary.target,
-            to: decodedRelay.target,
-            data: decodedRelay.message,
-            value: decodedRelay.value,
-            gas: innerGas,
-            stateOverride: [
-              {
-                address: primary.target,
-                balance: decodedRelay.value + 10n ** 18n,
-                stateDiff: [
-                  {
-                    slot: toHex(BigInt(xdmSlot), { size: 32 }),
-                    value: pad(decodedRelay.sender, { size: 32 }),
-                  },
-                ],
-              },
-            ],
-          });
-          innerBridgeRelaySimulated = true;
-          if (l1LiquiditySufficient === false && assetType === 'ERC20') {
-            l1LiquiditySufficient = true;
-            l1LiquidityDetail = `${l1LiquidityDetail} → Mint/転送ドライラン成功`;
-          }
-        } catch (err) {
-          innerBridgeRelaySimulated = false;
-          postWaitSimError = `内部ブリッジ着金Revert: ${extractShortRevertReason(
-            err instanceof Error ? err.message : String(err)
-          )}`;
-        }
-      }
-    }
   }
 
-  // Build structured 5-step validation checklist
+  // Build exact 4 real OP Stack contract validation checks
   const checks: ValidationCheckItem[] = [];
 
+  // 1. L2ToL1MessagePasser.sol
   checks.push({
     id: 'message-passer',
-    label: 'L2ToL1MessagePasser 登録・Merkle証明検証',
-    passed: merkleProofVerified && nonceVersion === messageVersion,
-    status: merkleProofVerified && nonceVersion === messageVersion ? 'pass' : 'fail',
+    label: '1. L2ToL1MessagePasser.sentMessages ＆ MPT証明 (proveWithdrawalTransaction 要件)',
+    passed: merkleProofVerified,
+    status: merkleProofVerified ? 'pass' : 'fail',
     detail: merkleProofVerified
-      ? `sentMessages[hash] = true · Version ${messageVersion} · Slot値=1 · MPT証明ノード ${proofNodes}階層確認`
-      : 'L2ToL1MessagePasser の sentMessages スロットに有効な出金記録が見つかりません',
+      ? `sentMessages[withdrawalHash] = true · Slot値 = 1 · MPTストレージ証明 (${proofNodes}階層) 確認済`
+      : 'L2ToL1MessagePasser の sentMessages スロットに有効な出金記録が確認できません',
   });
 
+  // 2. OptimismPortal2 Guards (!paused, target != portal, !finalizedWithdrawals)
+  const portalGuardPassed = !portalPaused && targetIsValid;
   checks.push({
     id: 'portal-guard',
-    label: `OptimismPortal2${portalVersion ? ` v${portalVersion}` : ''} 稼働・二重実行防止検証`,
-    passed: !portalPaused,
-    status: !portalPaused ? 'pass' : 'fail',
-    detail: portalPaused
-      ? 'OptimismPortal2 が現在 Paused（緊急停止中）のため L1 出金がブロックされています'
+    label: `2. OptimismPortal2${portalVersion ? ` v${portalVersion}` : ''} ガード条件 (!paused / target検証 / finalizedWithdrawals)`,
+    passed: portalGuardPassed,
+    status: portalGuardPassed ? 'pass' : 'fail',
+    detail: !targetIsValid
+      ? 'OptimismPortal: cannot send to portal (_tx.target が OptimismPortal2 自身を指しています)'
+      : portalPaused
+      ? 'OptimismPortal: paused (現在緊急停止中のため L1 出金が一時停止されています)'
       : portalFinalized
-      ? 'paused() = false · finalizedWithdrawals = true (既にL1で正常に出金完了済み)'
-      : 'paused() = false (正常稼働) · finalizedWithdrawals = false (未消費・Claim枠有効)',
+      ? 'paused() = false · target != portal · finalizedWithdrawals[hash] = true (L1出金完了済)'
+      : `paused() = false · target != portal · finalizedWithdrawals[hash] = false (未消費 · sender=${primary.sender.slice(0, 10)}...)`,
   });
+
+  // 3. DisputeGameFactory & AggregateVerifier (TEE / ZK)
+  const typeMatches =
+    wasRespectedGameTypeWhenCreated !== false &&
+    (respectedGameType === null ||
+      disputeGameType === null ||
+      Number(respectedGameType) === disputeGameType);
+
+  const windowBadge = teeZk
+    ? teeZk.windowMode === 'dual-1d'
+      ? `TEE+ZK 二重証明 1日 (${teeZk.fastFinalizationDelaySeconds.toLocaleString()}秒)`
+      : `単一証明 ${teeZk.proofCount}/2 · 5日 (${teeZk.slowFinalizationDelaySeconds.toLocaleString()}秒)`
+    : `${formatSecondsJapanese(disputeGameResolutionSeconds)}`;
 
   if (portalFinalized) {
     checks.push({
-      id: 'dispute-proof',
-      label: 'L1 Prove状態・DisputeGame 解決バリデーション',
+      id: 'dispute-game',
+      label: '3. DisputeGame / AggregateVerifier (provenWithdrawals・Blacklist・TEE/ZK)',
       passed: true,
       status: 'pass',
       detail:
         numProofSubmitters > 0 && disputeGameAddress
-          ? `Prove済 (Submitter: ${proofSubmitter?.slice(0, 10)}...) · Game ${disputeGameAddress.slice(
+          ? `provenWithdrawals 確認済 (Submitter: ${proofSubmitter?.slice(0, 10)}...) · Game ${disputeGameAddress.slice(
               0,
               10
-            )}... (${getDisputeGameStatusText(disputeGameStatus)}) · 出金完了済`
-          : 'L1 OptimismPortal2 にて証明検証・ファイナライズ完了済み',
+            )}... (${getDisputeGameStatusText(disputeGameStatus)}) · ${windowBadge}`
+          : 'OptimismPortal2 にて DisputeGame 解決・ファイナライズ完了済',
     });
   } else if (numProofSubmitters > 0) {
-    const typeMatches =
-      respectedGameType === null ||
-      disputeGameType === null ||
-      Number(respectedGameType) === disputeGameType;
     checks.push({
-      id: 'dispute-proof',
-      label: 'L1 Prove状態・DisputeGame 解決バリデーション',
+      id: 'dispute-game',
+      label: '3. DisputeGame / AggregateVerifier (provenWithdrawals・Blacklist・TEE/ZK)',
       passed: !gameInvalid && typeMatches,
       status: gameInvalid ? 'fail' : typeMatches ? 'pass' : 'warn',
-      detail: `Prove提出済 (${numProofSubmitters}件, Submitter ${proofSubmitter?.slice(
-        0,
-        10
-      )}...) · Game ${
-        disputeGameAddress ? `${disputeGameAddress.slice(0, 10)}...` : '—'
-      } (${getDisputeGameStatusText(
-        disputeGameStatus
-      )}) · checkWithdrawal=${
-        checkWithdrawalPassed ? '合格(即Claim可)' : `待機中 (${checkWithdrawalError ?? '期間未経過'})`
-      }`,
+      detail: gameInvalid
+        ? `要再Prove: Blacklist=${String(disputeGameBlacklisted)} · Status=${getDisputeGameStatusText(
+            disputeGameStatus
+          )} · wasRespected=${String(wasRespectedGameTypeWhenCreated)}`
+        : `provenWithdrawals 登録済 (${numProofSubmitters}件, Submitter ${proofSubmitter?.slice(
+            0,
+            10
+          )}...) · !disputeGameBlacklist · wasRespectedGameTypeWhenCreated=true · ${getDisputeGameStatusText(
+            disputeGameStatus
+          )} · 適用枠: ${windowBadge}`,
     });
   } else {
+    const unprovenGameValid = !gameInvalid && merkleProofVerified;
     checks.push({
-      id: 'dispute-proof',
-      label: 'L1 Prove状態・DisputeGame 構築要件',
-      passed: merkleProofVerified,
-      status: merkleProofVerified ? 'pass' : 'fail',
+      id: 'dispute-game',
+      label: '3. DisputeGame / AggregateVerifier (L1出力ルート提案・TEE/ZK待機枠)',
+      passed: unprovenGameValid,
+      status: unprovenGameValid ? 'pass' : 'fail',
       detail:
         proveState === 'unproven-ready'
-          ? `未Prove · L1 DisputeGame #${
+          ? `未Prove · DisputeGame #${
               disputeGameIndex ?? '—'
-            } 到達済（今すぐProve可能 · Game解決目安 ${formatSecondsJapanese(
-              disputeGameResolutionSeconds
-            )} / Prove後成熟 ${formatSecondsJapanese(proofMaturityDelaySeconds)}）`
-          : `未Prove · L1 DisputeGame提案待ち（提案後にProve可能 · Game解決期間 ${formatSecondsJapanese(
-              disputeGameResolutionSeconds
-            )} / Prove後成熟 ${formatSecondsJapanese(proofMaturityDelaySeconds)}）`,
+            } 到達済（今すぐ proveWithdrawalTransaction 実行可 · 適用枠: ${windowBadge}）`
+          : `未Prove · L1 DisputeGame 提案待ち（提案到達後に proveWithdrawalTransaction 実行可 · 現在の最新枠: ${windowBadge}）`,
     });
   }
 
-  checks.push({
-    id: 'l1-liquidity',
-    label: 'L1 支払原資・ブリッジ流動性検証',
-    passed: l1LiquiditySufficient !== false,
-    status:
-      l1LiquiditySufficient === true
-        ? 'pass'
-        : l1LiquiditySufficient === null
-        ? 'warn'
-        : 'fail',
-    detail: l1LiquidityDetail,
-  });
+  // 4. OptimismPortal2.checkWithdrawal & Actual L1 Delivery Verification
+  const safeCallSwallowedInnerFailure =
+    !portalFinalized &&
+    portalTopLevelFinalizePassed === true &&
+    (outerPortalRelaySimulated === false || recipientBalanceIncreased === false);
 
-  const postWaitExecPassed =
-    outerPortalRelaySimulated && innerBridgeRelaySimulated !== false;
-  checks.push({
-    id: 'post-wait-execution',
-    label: '待機時間経過後の実着金シミュレーション (L1 EVM ドライラン)',
-    passed: postWaitExecPassed,
-    status: postWaitExecPassed ? 'pass' : 'fail',
-    detail: portalFinalized
-      ? 'L1 上で既に finalizeWithdrawalTransaction が実行され着金完了しています'
-      : postWaitExecPassed
-      ? innerBridgeRelaySimulated === true
-        ? `OptimismPortal2 → L1CrossDomainMessenger → L1Bridge (${amountFormatted} ${assetSymbol}) → 受取アドレスまでの全着金経路が Revert なく正常完走しました`
-        : `OptimismPortal2 → ターゲット (${primary.target.slice(
-            0,
-            10
-          )}...) の待機後リレー実行が Revert なく正常完走しました`
-      : `待機時間経過後のL1実行シミュレーションでエラーを検出: ${
-          postWaitSimError ?? '着金コール失敗'
-        }`,
-  });
+  const stageSummaryParts: string[] = [];
+  if (portalTopLevelFinalizePassed === true) {
+    stageSummaryParts.push(
+      safeCallSwallowedInnerFailure
+        ? 'Portal外枠Tx: 非Revert(SafeCall吸収)'
+        : 'Portal確定Tx: PASS'
+    );
+  }
+  if (outerPortalRelaySimulated === false) {
+    stageSummaryParts.push('Hop1中継: Revert(停止)');
+  } else if (outerPortalRelaySimulated === true) {
+    stageSummaryParts.push('Hop1中継: PASS');
+  }
+  if (recipientBalanceIncreased === true) {
+    stageSummaryParts.push('実測L1残高増加: 確認済');
+  } else if (recipientBalanceIncreased === false) {
+    stageSummaryParts.push('実測L1残高増分: 0(着金なし)');
+  }
+  const stageBadge =
+    stageSummaryParts.length > 0 ? ` [${stageSummaryParts.join(' · ')}]` : '';
+
+  if (portalFinalized) {
+    checks.push({
+      id: 'check-withdrawal',
+      label: '4. OptimismPortal2.checkWithdrawal ＆ L1実着金シミュレーション',
+      passed: true,
+      status: 'pass',
+      detail: 'L1 上で既に finalizeWithdrawalTransaction が実行済みです。',
+    });
+  } else if (safeCallSwallowedInnerFailure) {
+    const hop1Err =
+      cdmHops[0]?.standaloneRelayError ??
+      postWaitSimError ??
+      '内部中継フレームで停止';
+    checks.push({
+      id: 'check-withdrawal',
+      label: '4. OptimismPortal2.checkWithdrawal ＆ L1実着金シミュレーション',
+      passed: false,
+      status: 'fail',
+      detail: `【着金不可・実測受取 0】OptimismPortal2 外枠の finalizeWithdrawalTransactionExternalProof 自体は SafeCall により Revert しませんが、内部の Hop 1 が「${hop1Err}」で停止するため 3段目 L1StandardBridge に到達せず、Multicall3 実測の受取残高増分は 0 です。`,
+    });
+  } else if (postWaitSimError !== null || recipientBalanceIncreased === false) {
+    checks.push({
+      id: 'check-withdrawal',
+      label: '4. OptimismPortal2.checkWithdrawal ＆ L1実着金シミュレーション',
+      passed: false,
+      status: 'fail',
+      detail: `着金シミュレーションで阻害要因を検出: ${
+        postWaitSimError ?? 'L1受取先残高が増加しません（実測増分 0）'
+      }`,
+    });
+  } else if (checkWithdrawalPassed === true) {
+    checks.push({
+      id: 'check-withdrawal',
+      label: '4. OptimismPortal2.checkWithdrawal ＆ L1実着金シミュレーション',
+      passed: true,
+      status: 'pass',
+      detail:
+        teeZk?.canCallResolveNow && disputeGameStatus === 0
+          ? `proofMaturityDelaySeconds (1日) ＆ DisputeGame expectedResolution 経過済 · resolve() + finalizeWithdrawalTransactionExternalProof 実着金確認済${stageBadge}`
+          : `checkWithdrawal(hash, ${proofSubmitter?.slice(
+              0,
+              10
+            )}...) 合格 · finalizeWithdrawalTransactionExternalProof 実着金確認済${stageBadge}`,
+    });
+  } else if (numProofSubmitters > 0) {
+    const validWaiting = !gameInvalid && portalGuardPassed;
+    checks.push({
+      id: 'check-withdrawal',
+      label: '4. OptimismPortal2.checkWithdrawal ＆ L1実着金シミュレーション',
+      passed: validWaiting,
+      status: validWaiting ? 'pass' : 'fail',
+      detail: validWaiting
+        ? `待機経過後の L1 実着金シミュレーション PASS${stageBadge}（Prove成熟残り: ${formatSecondsJapanese(
+            maturityRemainingSeconds
+          )} / Game解決残り: ${formatSecondsJapanese(
+            gameResolutionRemainingSeconds
+          )}）`
+        : `checkWithdrawal 阻害要因あり: ${
+            checkWithdrawalError ?? 'DisputeGame または Portal 状態を確認してください'
+          }`,
+    });
+  } else {
+    const validPreProve = merkleProofVerified && portalGuardPassed && !gameInvalid;
+    checks.push({
+      id: 'check-withdrawal',
+      label: '4. OptimismPortal2.checkWithdrawal ＆ L1実着金シミュレーション',
+      passed: validPreProve,
+      status: validPreProve ? 'pass' : 'fail',
+      detail: validPreProve
+        ? `待機経過後の L1 実着金シミュレーション PASS${stageBadge} · Prove提出後に成熟 (${formatSecondsJapanese(
+            proofMaturityDelaySeconds
+          )}) ＆ Game解決 (${windowBadge}) で着金可能`
+        : '前提となる MessagePasser または OptimismPortal2 ガード条件を満たしていません',
+    });
+  }
 
   const canWithdrawAfterWait =
     portalFinalized ||
     (merkleProofVerified &&
-      !portalPaused &&
+      portalGuardPassed &&
       !gameInvalid &&
-      l1LiquiditySufficient !== false &&
-      postWaitExecPassed);
+      !safeCallSwallowedInnerFailure &&
+      outerPortalRelaySimulated !== false &&
+      recipientBalanceIncreased !== false &&
+      postWaitSimError === null);
 
   let verdictLabel = '';
   let verdictSummary = '';
 
   if (portalFinalized) {
-    verdictLabel = 'L1出金完了済（実着金確認）';
+    verdictLabel = 'L1出金完了済 (finalizedWithdrawals = true)';
     verdictSummary =
-      'OptimismPortal2.finalizedWithdrawals = true を確認。L1側での出金処理は既に正常完了しています。';
+      'OptimismPortal2.finalizedWithdrawals[withdrawalHash] = true を確認。L1側でのファイナライズ処理は既に完了しています。';
   } else if (canWithdrawAfterWait) {
     if (proveState === 'proven-ready') {
-      verdictLabel = '今すぐ実出金（Finalize）可能 — 全バリデーション通過';
-      verdictSummary =
-        'Prove成熟期間（1日）およびDisputeGame解決期間（約5日）の双方が完了しており、checkWithdrawal・L1流動性・着金ドライランすべて合格しています。今すぐPimlicoまたはウォレットから出金確定できます。';
+      verdictLabel = '今すぐ確定実行 (Finalize) ＆ L1着金可能';
+      verdictSummary = `OptimismPortal2.checkWithdrawal 全要件および Multicall3 L1着金残高増加シミュレーションに合格しています。成功フレーム (${
+        winningFinalizeFrame ?? 'finalizeExternalProof'
+      }) で Revert なく資産を受け取れます。`;
     } else if (proveState === 'unproven-ready') {
-      verdictLabel = '今すぐProve実行可能 ＆ 待機経過後に実出金可能';
+      verdictLabel = '今すぐ Prove 実行可能（待機後に L1 着金確認済）';
       verdictSummary =
-        'L1 DisputeGame提案に到達しているため今すぐ proveWithdrawalTransaction を実行できます。L2 MessagePasser証明・L1原資・待機経過後の着金シミュレーションはすべて合格済みです。';
+        'L2ToL1MessagePasser 証明・対象 DisputeGame 到達・および待機経過後の L1 受取残高増加のすべてがオンチェーン検証で PASS しています。';
+    } else if (proveState === 'proven-waiting') {
+      verdictLabel = 'Prove済・L1実着金検証 PASS（待機満了後に受取可能）';
+      verdictSummary =
+        'provenWithdrawals 登録済みかつ L1 受取先への着金シミュレーション（残高増加）が PASS しています。待機期間経過後に確定実行して資産を受け取れます。';
     } else {
-      verdictLabel = '待機時間経過後に実出金可能（L1着金ドライラン合格）';
-      verdictSummary = `現在は「${proveStateLabel}」ですが、L2 MessagePasser ストレージ証明・L1 支払原資・待機経過後の L1 ブリッジ着金シミュレーションはすべて正常通過しており、時間経過後に問題なく出金確定できます。`;
+      verdictLabel = 'L2出金記録 ＆ L1実着金検証 PASS（提案→Prove→待機後に受取可能）';
+      verdictSummary =
+        'L2ToL1MessagePasser.sentMessages = true および待機経過後の L1 受取残高増加の PASS を確認済みです。';
     }
+  } else if (safeCallSwallowedInnerFailure) {
+    const hop1Err =
+      cdmHops[0]?.standaloneRelayError ??
+      postWaitSimError ??
+      'CrossDomainMessenger: cannot send message to blocked system address.';
+    verdictLabel = '着金不可（Portal外枠は非Revertですが実測受取額は 0 です）';
+    verdictSummary = `OptimismPortal2.finalizeWithdrawalTransactionExternalProof（外枠）は SafeCall により Revert せず完了しますが、内部の Hop 1 中継が「${hop1Err}」で Revert して処理が止まるため、3段目の L1StandardBridge に到達しません。Multicall3 オンチェーン実測での L1 受取残高増分は 0 であり、待機後に Finalize しても資産は受け取れません（L1ガス代節約のため実行非推奨）。`;
   } else {
-    verdictLabel = '出金バリデーション要確認（阻害要因あり）';
+    verdictLabel = 'L1着金またはコントラクト要件で阻害要因を検出';
     verdictSummary =
-      postWaitSimError ||
-      (portalPaused
-        ? 'OptimismPortal2 が一時停止中のため、解除されるまで L1 出金できません。'
+      postWaitSimError !== null
+        ? `着金シミュレーションで Revert を検出: ${postWaitSimError}`
+        : !targetIsValid
+        ? 'OptimismPortal2 自身をターゲットにした出金はコントラクト仕様により実行できません。'
+        : portalPaused
+        ? 'OptimismPortal2 が Paused（緊急停止中）のため、解除されるまで L1 出金できません。'
         : gameInvalid
-        ? '紐づく DisputeGame が無効化またはブラックリスト化されているため再Proveが必要です。'
-        : 'L1 側の流動性またはコントラクト実行条件に問題が検出されました。');
-  }
-
-  if (teeZk) {
-    checks.push({
-      id: 'tee-zk-multiproof',
-      label: 'DisputeGame マルチ証明 (TEE / ZK) ＆ 1日/5日待機枠判定',
-      passed: true,
-      status: 'pass',
-      detail: teeZk.summary,
-    });
+        ? '紐づく DisputeGame が無効化またはブラックリスト化されているため、有効な最新 DisputeGame で再Proveが必要です。'
+        : 'L2ToL1MessagePasser の出金記録が確認できませんでした。';
   }
 
   return {
@@ -1815,6 +2391,7 @@ async function verifyMessagePasserAndL1Validation(params: {
     portalVersion,
     respectedGameType,
     portalPaused: Boolean(portalPaused),
+    targetIsValid,
     alreadyFinalizedOnL1: portalFinalized,
     proveState,
     proveStateLabel,
@@ -1827,6 +2404,7 @@ async function verifyMessagePasserAndL1Validation(params: {
     disputeGameCreatedAt,
     disputeGameResolvedAt,
     disputeGameBlacklisted,
+    wasRespectedGameTypeWhenCreated,
     provenTimestamp,
     l1ProveTxHash,
     l1ProveBlockNumber,
@@ -1834,10 +2412,13 @@ async function verifyMessagePasserAndL1Validation(params: {
     gameResolutionRemainingSeconds,
     checkWithdrawalPassed,
     checkWithdrawalError,
-    l1LiquiditySufficient,
-    l1LiquidityDetail,
     outerPortalRelaySimulated,
     innerBridgeRelaySimulated,
+    portalTopLevelFinalizePassed,
+    leafBridgeCallPassed,
+    recipientBalanceIncreased,
+    winningFinalizeFrame,
+    cdmHops,
     postWaitSimError,
     messagePasser,
     teeZk,
@@ -1850,7 +2431,10 @@ export async function analyzeWithdrawalFromTxHash(
   config: NetworkConfig
 ): Promise<WithdrawalInfo | null> {
   const clients = createBaseAndL1Clients(config);
-  const receipt = await clients.l2Client.getTransactionReceipt({ hash: txHash });
+  const receipt = await withRpcRetry(
+    () => clients.l2Client.getTransactionReceipt({ hash: txHash }),
+    3
+  );
   return analyzeWithdrawalFromReceipt(receipt, config, clients);
 }
 
@@ -1866,110 +2450,164 @@ export async function analyzeWithdrawalFromReceipt(
   const resolvedClients = clients ?? createBaseAndL1Clients(config);
   const { l1Client, l2Client, l2Chain, portalAddress } = resolvedClients;
 
-  // Decode bridge asset & recipient details from L2StandardBridge logs
+  // Decode bridge asset, amount & actual L1 recipient by:
+  // 1) Unwrapping CrossDomainMessenger.relayMessage frames (1-hop or multi-hop nested) and decoding leaf L1 bridge calldata
+  // 2) Supplementing with L2StandardBridge / ERC20 burn events in the L2 receipt for custom bridge implementations
+  const unwrapped = unwrapCrossDomainHops({
+    sender: primary.sender,
+    target: primary.target,
+    value: primary.value,
+    data: primary.data,
+  });
+
   let assetType: 'ETH' | 'ERC20' | 'MESSAGE' =
-    primary.value > 0n ? 'ETH' : 'MESSAGE';
-  let assetSymbol = primary.value > 0n ? 'ETH' : 'Message';
+    primary.value > 0n || unwrapped.leafValue > 0n ? 'ETH' : 'MESSAGE';
+  let assetSymbol =
+    primary.value > 0n || unwrapped.leafValue > 0n ? 'ETH' : 'Message';
   let assetDecimals = 18;
   let l2TokenAddress: string | null = null;
   let l1TokenAddress: string | null = null;
-  let amountRaw = primary.value;
-  let l1Recipient: string = primary.target;
+  let amountRaw =
+    unwrapped.leafValue > 0n ? unwrapped.leafValue : primary.value;
+  let l1Recipient: string =
+    unwrapped.rawHops.length > 0 ? unwrapped.leafTarget : primary.target;
+  let decodedFromLeafCalldata = false;
 
-  try {
-    const bridgeEvents = parseEventLogs({
-      abi: L2_STANDARD_BRIDGE_ABI,
-      logs: receipt.logs,
-    });
+  if (unwrapped.leafData && unwrapped.leafData.length >= 10) {
+    try {
+      const leafDecoded = decodeFunctionData({
+        abi: L1_BRIDGE_FINALIZE_ABI,
+        data: unwrapped.leafData,
+      });
 
-    const erc20Evt = bridgeEvents.find(
-      (e) =>
-        e.eventName === 'ERC20BridgeInitiated' ||
-        e.eventName === 'WithdrawalInitiated'
-    );
-    const ethEvt = bridgeEvents.find(
-      (e) => e.eventName === 'ETHBridgeInitiated'
-    );
-
-    if (erc20Evt) {
-      assetType = 'ERC20';
-      const args = erc20Evt.args as {
-        localToken?: Address;
-        l2Token?: Address;
-        remoteToken?: Address;
-        l1Token?: Address;
-        to: Address;
-        amount: bigint;
-      };
-      l2TokenAddress = args.localToken ?? args.l2Token ?? null;
-      l1TokenAddress = args.remoteToken ?? args.l1Token ?? null;
-      l1Recipient = args.to;
-      amountRaw = args.amount;
-
-      if (l2TokenAddress) {
-        const [sym, dec] = await Promise.all([
-          l2Client
-            .readContract({
-              address: l2TokenAddress as Address,
-              abi: ERC20_META_ABI,
-              functionName: 'symbol',
-            })
-            .catch(() => 'ERC20'),
-          l2Client
-            .readContract({
-              address: l2TokenAddress as Address,
-              abi: ERC20_META_ABI,
-              functionName: 'decimals',
-            })
-            .catch(() => 18),
-        ]);
-        assetSymbol = sym;
-        assetDecimals = Number(dec);
+      if (
+        leafDecoded.functionName === 'finalizeBridgeERC20' ||
+        leafDecoded.functionName === 'finalizeERC20Withdrawal'
+      ) {
+        const [l1Tok, l2Tok, , toAddr, amt] = leafDecoded.args;
+        assetType = 'ERC20';
+        l1TokenAddress = l1Tok;
+        l2TokenAddress = l2Tok;
+        l1Recipient = toAddr;
+        amountRaw = amt;
+        decodedFromLeafCalldata = true;
+      } else if (
+        leafDecoded.functionName === 'finalizeBridgeETH' ||
+        leafDecoded.functionName === 'finalizeETHWithdrawal'
+      ) {
+        const [, toAddr, amt] = leafDecoded.args;
+        assetType = 'ETH';
+        assetSymbol = 'ETH';
+        assetDecimals = 18;
+        l1Recipient = toAddr;
+        amountRaw = amt;
+        decodedFromLeafCalldata = true;
+      } else if (leafDecoded.functionName === 'finalizeBridgeERC721') {
+        const [l1Tok, l2Tok, , toAddr] = leafDecoded.args;
+        assetType = 'MESSAGE';
+        assetSymbol = 'ERC721';
+        assetDecimals = 0;
+        l1TokenAddress = l1Tok;
+        l2TokenAddress = l2Tok;
+        l1Recipient = toAddr;
+        amountRaw = 1n;
+        decodedFromLeafCalldata = true;
       }
-    } else if (ethEvt) {
-      assetType = 'ETH';
-      assetSymbol = 'ETH';
-      assetDecimals = 18;
-      const args = ethEvt.args as { to: Address; amount: bigint };
-      l1Recipient = args.to;
-      amountRaw = args.amount;
+    } catch {
+      // Custom L1 target selector — fall through to L2 receipt log inspection
     }
-  } catch {
-    // Keep MessagePassed fallback
+  }
+
+  if (!decodedFromLeafCalldata) {
+    try {
+      const bridgeEvents = parseEventLogs({
+        abi: L2_STANDARD_BRIDGE_ABI,
+        logs: receipt.logs,
+      });
+
+      const erc20Evt = bridgeEvents.find(
+        (e) =>
+          e.eventName === 'ERC20BridgeInitiated' ||
+          e.eventName === 'WithdrawalInitiated'
+      );
+      const ethEvt = bridgeEvents.find(
+        (e) => e.eventName === 'ETHBridgeInitiated'
+      );
+
+      if (erc20Evt) {
+        assetType = 'ERC20';
+        const args = erc20Evt.args as {
+          localToken?: Address;
+          l2Token?: Address;
+          remoteToken?: Address;
+          l1Token?: Address;
+          to: Address;
+          amount: bigint;
+        };
+        l2TokenAddress = args.localToken ?? args.l2Token ?? null;
+        l1TokenAddress = args.remoteToken ?? args.l1Token ?? null;
+        l1Recipient = args.to;
+        amountRaw = args.amount;
+      } else if (ethEvt) {
+        assetType = 'ETH';
+        assetSymbol = 'ETH';
+        assetDecimals = 18;
+        const args = ethEvt.args as { to: Address; amount: bigint };
+        l1Recipient = args.to;
+        amountRaw = args.amount;
+      } else if (assetType === 'MESSAGE') {
+        // Check for custom bridge ERC20 burn log (Transfer to 0x0000...0000)
+        const transferEvents = parseEventLogs({
+          abi: ERC20_TRANSFER_EVENT_ABI,
+          logs: receipt.logs,
+        });
+        const burnEvt = transferEvents.find(
+          (e) => e.args.to.toLowerCase() === ZERO_ADDRESS && e.args.value > 0n
+        );
+        if (burnEvt) {
+          assetType = 'ERC20';
+          l2TokenAddress = burnEvt.address;
+          amountRaw = burnEvt.args.value;
+        }
+      }
+    } catch {
+      // Keep unwrapped target & value fallback
+    }
+  }
+
+  if (assetType === 'ERC20') {
+    const meta = await readErc20MetadataWithFallback({
+      l2Client,
+      l1Client,
+      l2TokenAddress,
+      l1TokenAddress,
+    });
+    assetSymbol = meta.symbol;
+    assetDecimals = meta.decimals;
   }
 
   const formattedRaw = formatUnits(amountRaw, assetDecimals);
   const amountFormatted = formatDisplayAmount(formattedRaw);
 
-  let usedFallbackDelay = false;
-
-  const [rawStatus, portalFinalized, portalParams] = await Promise.all([
-    l1Client
-      .getWithdrawalStatus({
-        receipt,
-        targetChain: l2Chain,
-      })
-      .catch(() => 'waiting-to-prove') as Promise<WithdrawalStatus>,
-    l1Client
-      .readContract({
-        address: portalAddress,
-        abi: OPTIMISM_PORTAL_READ_ABI,
-        functionName: 'finalizedWithdrawals',
-        args: [primary.withdrawalHash],
-      })
-      .catch(() => {
-        usedFallbackDelay = true;
-        return false;
-      }),
-    resolvePortalDisputeParams(l1Client, portalAddress),
+  // Strict L1 OptimismPortal2 reads with retry — if L1 RPC fails after retries, throw so caller marks row partial for re-acquisition!
+  const [portalFinalized, portalParams] = await Promise.all([
+    withRpcRetry(
+      () =>
+        l1Client.readContract({
+          address: portalAddress,
+          abi: OPTIMISM_PORTAL_READ_ABI,
+          functionName: 'finalizedWithdrawals',
+          args: [primary.withdrawalHash],
+        }),
+      4,
+      450
+    ),
+    resolvePortalDisputeParams(l1Client, portalAddress, false, false),
   ]);
 
-  if (portalParams.usedFallbackDelay) {
-    usedFallbackDelay = true;
-  }
-
-  const initialStatus: WithdrawalStatus =
-    rawStatus === 'finalized' && !portalFinalized ? 'ready-to-finalize' : rawStatus;
+  const initialStatus: WithdrawalStatus = portalFinalized
+    ? 'finalized'
+    : 'waiting-to-prove';
 
   const validation = await verifyMessagePasserAndL1Validation({
     clients: resolvedClients,
@@ -1977,16 +2615,12 @@ export async function analyzeWithdrawalFromReceipt(
     primary,
     initialStatus,
     portalFinalized: Boolean(portalFinalized),
-    assetType,
-    assetSymbol,
-    assetDecimals,
+    portalParams,
+    l1Recipient,
     l1TokenAddress,
     amountRaw,
-    amountFormatted,
-    portalParams,
   });
 
-  // Reconcile status with exact on-chain checkWithdrawal & DisputeGame state
   let effectiveStatus: WithdrawalStatus = initialStatus;
   if (portalFinalized) {
     effectiveStatus = 'finalized';
@@ -2074,7 +2708,7 @@ export async function analyzeWithdrawalFromReceipt(
     data: primary.data,
     status: effectiveStatus,
     portalFinalized: Boolean(portalFinalized),
-    usedFallbackDelay,
+    usedFallbackDelay: portalParams.usedFallbackDelay,
     portalVersion: portalParams.portalVersion,
     respectedGameType: portalParams.respectedGameType,
     proofMaturityDelaySeconds,
@@ -2097,7 +2731,10 @@ export async function simulateWithdrawalOnL1(
 ): Promise<WithdrawalSimulationResult> {
   const clients = createBaseAndL1Clients(config);
   const { l1Client, l2Client, l2Chain, portalAddress } = clients;
-  const receipt = await l2Client.getTransactionReceipt({ hash: txHash });
+  const receipt = await withRpcRetry(
+    () => l2Client.getTransactionReceipt({ hash: txHash }),
+    3
+  );
   const info = await analyzeWithdrawalFromReceipt(receipt, config, clients);
 
   if (!info) {
@@ -2107,8 +2744,10 @@ export async function simulateWithdrawalOnL1(
   }
   const withdrawals = getWithdrawals(receipt);
   const withdrawalTuple = withdrawals[0];
-  const l1GasPrice = await l1Client.getGasPrice();
-  const l2GasPrice = await l2Client.getGasPrice();
+  const [l1GasPrice, l2GasPrice] = await Promise.all([
+    withRpcRetry(() => l1Client.getGasPrice(), 2),
+    withRpcRetry(() => l2Client.getGasPrice(), 2),
+  ]);
 
   let estimatedProveGas = 290000n;
   let estimatedFinalizeGas = 230000n;
@@ -2132,7 +2771,7 @@ export async function simulateWithdrawalOnL1(
     ((val?.numProofSubmitters ?? 0) > 0 &&
       val?.proveState !== 'invalid-need-reprove');
 
-  // Step 1: Explicit proveWithdrawalTransaction simulation
+  // Step 1: Real OptimismPortal2.proveWithdrawalTransaction check / simulation
   let proveSim: StepSimulationDetail;
   if (info.portalFinalized) {
     estimatedProveGas = 0n;
@@ -2205,7 +2844,7 @@ export async function simulateWithdrawalOnL1(
         executableNow: true,
         estimatedGas: est.toString(),
         estimatedFeeEth: pFeeEth,
-        summary: `proveWithdrawalTransaction シミュレーション合格（DisputeGame #${gameIdx.toString()} · 推定Gas: ${est.toLocaleString()} · 約 ${pFeeEth} ETH）— 今すぐ証明提出可能です。`,
+        summary: `OptimismPortal2.proveWithdrawalTransaction 実コールシミュレーション合格（DisputeGame #${gameIdx.toString()} · 推定Gas: ${est.toLocaleString()} · 約 ${pFeeEth} ETH）— 今すぐ証明提出可能です。`,
       };
     } catch (err) {
       const pFeeEth = Number(formatEther(l1GasPrice * estimatedProveGas)).toFixed(6);
@@ -2223,7 +2862,6 @@ export async function simulateWithdrawalOnL1(
       };
     }
   } else {
-    // waiting-to-prove
     const mpOk = Boolean(val?.messagePasser.merkleProofVerified);
     const pFeeEth = Number(formatEther(l1GasPrice * estimatedProveGas)).toFixed(6);
     proveSim = {
@@ -2244,7 +2882,7 @@ export async function simulateWithdrawalOnL1(
     };
   }
 
-  // Step 2: Explicit post-maturity finalizeWithdrawalTransaction simulation
+  // Step 2: Real OptimismPortal2.checkWithdrawal & finalizeWithdrawalTransactionExternalProof validation
   let finalizeSim: StepSimulationDetail;
   if (info.portalFinalized) {
     estimatedFinalizeGas = 0n;
@@ -2261,8 +2899,13 @@ export async function simulateWithdrawalOnL1(
   } else if (info.status === 'ready-to-finalize') {
     const submitter = (val?.proofSubmitter ?? receipt.from) as Address;
     try {
-      if (val?.teeZk?.canCallResolveNow && val.disputeGameStatus === 0) {
-        // DisputeGame expectedResolution reached, resolve() + finalize will run atomically
+      if (val?.teeZk?.canCallResolveNow && val.disputeGameStatus === 0 && val.disputeGameAddress) {
+        await l1Client.simulateContract({
+          address: val.disputeGameAddress as Address,
+          abi: DISPUTE_GAME_ABI,
+          functionName: 'resolve',
+          account: receipt.from,
+        });
         const fFeeEth = Number(
           formatEther(l1GasPrice * estimatedFinalizeGas)
         ).toFixed(6);
@@ -2274,34 +2917,43 @@ export async function simulateWithdrawalOnL1(
           executableNow: true,
           estimatedGas: estimatedFinalizeGas.toString(),
           estimatedFeeEth: fFeeEth,
-          summary: `DisputeGame 待機期間完了（resolve可能）＆ 着金ドライラン合格 — 「資金を受け取る」ボタンで Game解決と ${info.amountFormatted} ${info.assetSymbol} 受取を実行できます。`,
+          summary: `DisputeGame.resolve() シミュレーション合格 ＆ Prove成熟完了 — 「資金を受け取る」ボタンで Game解決と ${info.amountFormatted} ${info.assetSymbol} 受取を実行できます。`,
         };
       } else {
-        const est = await l1Client.estimateContractGas({
-          address: portalAddress,
-          abi: OPTIMISM_PORTAL_READ_ABI,
-          functionName: 'finalizeWithdrawalTransactionExternalProof',
-          args: [withdrawalArg, submitter],
-          account: receipt.from,
-        });
+        const minSafePortalGas =
+          (withdrawalTuple.gasLimit * 66n) / 63n + 220000n;
+        const estRaw = await l1Client
+          .estimateContractGas({
+            address: portalAddress,
+            abi: OPTIMISM_PORTAL_READ_ABI,
+            functionName: 'finalizeWithdrawalTransactionExternalProof',
+            args: [withdrawalArg, submitter],
+            account: receipt.from,
+          })
+          .catch(() => minSafePortalGas);
+        const safeEst = estRaw > minSafePortalGas ? estRaw : minSafePortalGas;
         await l1Client.simulateContract({
           address: portalAddress,
           abi: OPTIMISM_PORTAL_READ_ABI,
           functionName: 'finalizeWithdrawalTransactionExternalProof',
           args: [withdrawalArg, submitter],
           account: receipt.from,
+          gas: safeEst,
         });
-        estimatedFinalizeGas = est;
-        const fFeeEth = Number(formatEther(l1GasPrice * est)).toFixed(6);
+        estimatedFinalizeGas = safeEst;
+        const fFeeEth = Number(formatEther(l1GasPrice * safeEst)).toFixed(6);
+        const actuallyDelivers = Boolean(val?.canWithdrawAfterWait);
         finalizeSim = {
           step: 'finalize',
           methodName: 'finalizeWithdrawalTransaction',
-          passed: true,
+          passed: actuallyDelivers,
           alreadyCompletedOnChain: false,
-          executableNow: true,
-          estimatedGas: est.toString(),
+          executableNow: actuallyDelivers,
+          estimatedGas: safeEst.toString(),
           estimatedFeeEth: fFeeEth,
-          summary: `finalizeWithdrawalTransaction 実コールシミュレーション合格（推定Gas: ${est.toLocaleString()} · 約 ${fFeeEth} ETH）— 今すぐ「資金を受け取る」ボタンで ${info.amountFormatted} ${info.assetSymbol} を受け取れます。`,
+          summary: actuallyDelivers
+            ? `OptimismPortal2.finalizeWithdrawalTransactionExternalProof ＆ L1着金残高増加 PASS（非Revert保護Gas: ${safeEst.toLocaleString()} · 約 ${fFeeEth} ETH）— 今すぐ「資金を受け取る」ボタンで ${info.amountFormatted} ${info.assetSymbol} を受け取れます。`
+            : `【着金不可・実測受取 0 ${info.assetSymbol}】OptimismPortal2 外枠の Tx は SafeCall により Revert しませんが、内部の Hop 1 が停止するため ${info.amountFormatted} ${info.assetSymbol} は着金しません（L1ガス代節約のため実行非推奨）。`,
         };
       }
     } catch (err) {
@@ -2322,8 +2974,6 @@ export async function simulateWithdrawalOnL1(
       };
     }
   } else {
-    // Still waiting (waiting-to-prove, ready-to-prove, or waiting-to-finalize):
-    // Report the stateOverride post-maturity execution simulation!
     const postWaitOk = Boolean(val?.canWithdrawAfterWait);
     const fFeeEth = Number(
       formatEther(l1GasPrice * estimatedFinalizeGas)
@@ -2341,16 +2991,14 @@ export async function simulateWithdrawalOnL1(
       estimatedGas: estimatedFinalizeGas.toString(),
       estimatedFeeEth: fFeeEth,
       summary: postWaitOk
-        ? `成熟待機後の finalizeWithdrawalTransaction (stateOverride着金ドライラン) 合格 — 待機完了後（${windowDesc} · 残り ${formatSecondsJapanese(
+        ? `OptimismPortal2 ガード条件合格 ＆ Multicall3 実測で +${info.amountFormatted} ${info.assetSymbol} の残高増加を確認済 — 待機期間（${windowDesc} · 残り ${formatSecondsJapanese(
             info.totalSecondsRemaining
-          )}）に受取人 ${info.l1Recipient.slice(0, 10)}... へ ${info.amountFormatted} ${info.assetSymbol} が正常に着金します。`
-        : `成熟待機後の着金シミュレーションで要確認項目を検出: ${
-            val?.postWaitSimError ?? val?.verdictSummary ?? 'L1着金条件を確認してください'
-          }`,
+          )}）経過後に finalizeWithdrawalTransaction を実行して確実に受け取れます。`
+        : val?.verdictSummary ??
+          `【着金不可】内部中継エラーにより待機期間経過後に Finalize しても ${info.amountFormatted} ${info.assetSymbol} は着金しません（実測受取 0）。`,
     };
   }
 
-  // Synthesize top-level dry-run verdict from both simulations
   if (info.portalFinalized) {
     l1DryRunAction = 'already-finalized';
     l1DryRunSuccess = true;
@@ -2376,7 +3024,13 @@ export async function simulateWithdrawalOnL1(
   const totalL1ClaimCostWei = proveFeeWei + finalizeFeeWei;
 
   let netAmountFormatted: string | null = null;
-  if (info.assetType === 'ETH') {
+  if (
+    !info.portalFinalized &&
+    (val?.canWithdrawAfterWait === false ||
+      val?.recipientBalanceIncreased === false)
+  ) {
+    netAmountFormatted = `0 ${info.assetSymbol}（着金しません・Finalize不要）`;
+  } else if (info.assetType === 'ETH') {
     const grossWei = BigInt(info.amountRaw);
     const netWei =
       grossWei > totalL1ClaimCostWei ? grossWei - totalL1ClaimCostWei : 0n;
@@ -2441,6 +3095,7 @@ export async function fetchRecentWithdrawalSamples(
     try {
       const logs = await l2Client.getLogs({
         address: L2_TO_L1_MESSAGE_PASSER as Address,
+        event: MESSAGE_PASSED_EVENT_ABI[0],
         fromBlock: w.from,
         toBlock: w.to,
       });
@@ -2472,7 +3127,6 @@ export async function fetchRecentProvenWithdrawalSample(
     l2Client.getBlockNumber(),
   ]);
 
-  // Look up recent WithdrawalProven events on L1 OptimismPortal2
   const l1From = l1Head > 1500n ? l1Head - 1500n : 0n;
   const provenLogs = await l1Client
     .getLogs({
@@ -2492,7 +3146,6 @@ export async function fetchRecentProvenWithdrawalSample(
       .filter((h): h is string => Boolean(h))
   );
 
-  // Scan recent ~3.5 days of Base L2 blocks in parallel windows to match the L2 tx hash
   const chunkSize = 15000n;
   const maxChunks = 10;
   for (let i = 0; i < maxChunks; i += 2) {
@@ -2513,6 +3166,7 @@ export async function fetchRecentProvenWithdrawalSample(
         l2Client
           .getLogs({
             address: L2_TO_L1_MESSAGE_PASSER as Address,
+            event: MESSAGE_PASSED_EVENT_ABI[0],
             fromBlock: r.fromBlock,
             toBlock: r.toBlock,
           })

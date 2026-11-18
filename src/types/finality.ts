@@ -166,6 +166,21 @@ export interface StepSimulationDetail {
   summary: string;
 }
 
+export interface CdmHopInspection {
+  hopIndex: number;
+  messengerAddress: string;
+  nonce: string;
+  sender: string;
+  target: string;
+  valueWei: string;
+  minGasLimit: string;
+  versionedHash: string;
+  successfulMessage: boolean | null;
+  failedMessage: boolean | null;
+  standaloneRelayPassed?: boolean | null;
+  standaloneRelayError?: string | null;
+}
+
 export interface WithdrawalValidationReport {
   canWithdrawAfterWait: boolean;
   verdictLabel: string;
@@ -174,6 +189,7 @@ export interface WithdrawalValidationReport {
   portalVersion: string | null;
   respectedGameType: number | null;
   portalPaused: boolean;
+  targetIsValid?: boolean;
   alreadyFinalizedOnL1: boolean;
   proveState: ProveLifecycleState;
   proveStateLabel: string;
@@ -186,6 +202,7 @@ export interface WithdrawalValidationReport {
   disputeGameCreatedAt: number | null;
   disputeGameResolvedAt: number | null;
   disputeGameBlacklisted: boolean | null;
+  wasRespectedGameTypeWhenCreated?: boolean | null;
   provenTimestamp: number | null;
   l1ProveTxHash?: string | null;
   l1ProveBlockNumber?: number | null;
@@ -193,14 +210,44 @@ export interface WithdrawalValidationReport {
   gameResolutionRemainingSeconds: number | null;
   checkWithdrawalPassed: boolean | null;
   checkWithdrawalError: string | null;
-  l1LiquiditySufficient: boolean | null;
-  l1LiquidityDetail: string;
-  outerPortalRelaySimulated: boolean;
-  innerBridgeRelaySimulated: boolean | null;
+  l1LiquiditySufficient?: boolean | null;
+  l1LiquidityDetail?: string;
+  outerPortalRelaySimulated?: boolean;
+  innerBridgeRelaySimulated?: boolean | null;
+  portalTopLevelFinalizePassed?: boolean | null;
+  leafBridgeCallPassed?: boolean | null;
+  recipientBalanceIncreased?: boolean | null;
+  winningFinalizeFrame?:
+    | 'resolve+finalizeExternalProof'
+    | 'finalizeExternalProof'
+    | 'finalizeDirect'
+    | null;
+  cdmHops?: CdmHopInspection[];
   postWaitSimError: string | null;
   messagePasser: MessagePasserStatus;
   teeZk?: TeeZkProofInspection | null;
   checks: ValidationCheckItem[];
+}
+
+export interface WithdrawalAddressCheckItem {
+  index: number;
+  address: string;
+  isValidAddress: boolean;
+  l1Kind: 'EOA' | 'EIP-7702' | 'Contract' | 'Invalid';
+  l2Kind: 'EOA' | 'EIP-7702' | 'Contract' | 'Invalid';
+  l1DelegateOrCodeInfo: string | null;
+  l2DelegateOrCodeInfo: string | null;
+  l1Nonce: number;
+  l2Nonce: number;
+  l1EthBalance: string;
+  l2EthBalance: string;
+  l1UsdtBalance: string;
+  l1UsdcBalance: string;
+  l1EthReceivable: boolean;
+  l1UsdtBlacklisted: boolean;
+  l1UsdcBlacklisted: boolean;
+  status: 'safe' | 'caution' | 'blocked';
+  notes: string[];
 }
 
 export interface WithdrawalInfo {
@@ -290,6 +337,7 @@ export interface VerifiedTransactionResult {
   logsCount: number | null;
   txType: string | null;
   errorReason: string | null;
+  hasWithdrawalLog?: boolean;
   rawTx: RawTxData | null;
   rawReceipt: RawReceiptData | null;
   withdrawal: WithdrawalInfo | null;

@@ -30,6 +30,7 @@ import {
   formatUnixTimestamp,
   shortenHex,
 } from '../lib/exportUtils';
+import { isPartiallyFetchedOrBrokenResult } from '../lib/finalizedCache';
 import {
   formatSecondsJapanese,
   getWithdrawalProveDisplayMeta,
@@ -70,14 +71,7 @@ export function VerificationTable({
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const retryableHashes = useMemo(
-    () =>
-      results
-        .filter(
-          (r) =>
-            r.finality === FinalityStage.RPC_ERROR ||
-            r.finality === FinalityStage.NOT_FOUND
-        )
-        .map((r) => r.hash),
+    () => results.filter(isPartiallyFetchedOrBrokenResult).map((r) => r.hash),
     [results]
   );
 
@@ -108,15 +102,19 @@ export function VerificationTable({
 
     for (const r of results) {
       if (r.withdrawal) withdrawals += 1;
-      if (r.finality === FinalityStage.FINALIZED) finalized += 1;
-      else if (r.finality === FinalityStage.SAFE) safe += 1;
-      else if (
-        r.finality === FinalityStage.UNSAFE ||
-        r.finality === FinalityStage.PENDING
+      if (
+        isPartiallyFetchedOrBrokenResult(r) ||
+        r.finality === FinalityStage.NOT_FOUND ||
+        r.finality === FinalityStage.INVALID ||
+        r.finality === FinalityStage.RPC_ERROR
       ) {
-        unsafeOrPending += 1;
-      } else {
         errors += 1;
+      } else if (r.finality === FinalityStage.FINALIZED) {
+        finalized += 1;
+      } else if (r.finality === FinalityStage.SAFE) {
+        safe += 1;
+      } else {
+        unsafeOrPending += 1;
       }
 
       if (r.executionStatus === ExecutionStatus.REVERTED) {
@@ -138,12 +136,13 @@ export function VerificationTable({
   const filteredResults = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return results.filter((r) => {
-      if (filterMode === 'finalized' && r.finality !== FinalityStage.FINALIZED) return false;
-      if (filterMode === 'safe' && r.finality !== FinalityStage.SAFE) return false;
+      if (filterMode === 'finalized' && (r.finality !== FinalityStage.FINALIZED || isPartiallyFetchedOrBrokenResult(r))) return false;
+      if (filterMode === 'safe' && (r.finality !== FinalityStage.SAFE || isPartiallyFetchedOrBrokenResult(r))) return false;
       if (
         filterMode === 'unsafe_pending' &&
-        r.finality !== FinalityStage.UNSAFE &&
-        r.finality !== FinalityStage.PENDING
+        ((r.finality !== FinalityStage.UNSAFE &&
+          r.finality !== FinalityStage.PENDING) ||
+          isPartiallyFetchedOrBrokenResult(r))
       ) {
         return false;
       }
@@ -155,6 +154,7 @@ export function VerificationTable({
       }
       if (
         filterMode === 'errors' &&
+        !isPartiallyFetchedOrBrokenResult(r) &&
         r.finality !== FinalityStage.NOT_FOUND &&
         r.finality !== FinalityStage.INVALID &&
         r.finality !== FinalityStage.RPC_ERROR
@@ -533,7 +533,7 @@ export function VerificationTable({
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                未検出 / エラー ({counts.errors})
+                未取得 / エラー ({counts.errors})
               </button>
             )}
           </div>
@@ -544,15 +544,15 @@ export function VerificationTable({
                 type="button"
                 onClick={() => onRetryErrors(retryableHashes)}
                 disabled={isRetryingErrors || isVerifying}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
               >
                 <RefreshCw
                   className={`w-3.5 h-3.5 ${isRetryingErrors ? 'animate-spin' : ''}`}
                 />
                 <span>
                   {isRetryingErrors
-                    ? 'エラー項目を再検証中...'
-                    : `エラー/未検出のみ再実行 (${retryableHashes.length}件)`}
+                    ? '未取得項目を再取得中...'
+                    : `未取得・部分照合のみ再取得 (${retryableHashes.length}件)`}
                 </span>
               </button>
             )}

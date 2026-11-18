@@ -34,10 +34,17 @@ import {
 } from '../lib/exportUtils';
 import {
   formatSecondsJapanese,
+  getWithdrawalProveDisplayMeta,
   getWithdrawalStatusLabel,
 } from '../lib/withdrawalAnalyzer';
 
-type WithdrawalFilter = 'all' | 'pending_action' | 'ready' | 'claimed' | 'other_or_error';
+type WithdrawalFilter =
+  | 'all'
+  | 'unproven'
+  | 'proven_waiting'
+  | 'ready'
+  | 'claimed'
+  | 'other_or_error';
 
 interface WithdrawalVerificationSectionProps {
   rawInput: string;
@@ -161,17 +168,21 @@ export function WithdrawalVerificationSection({
   const counts = useMemo(() => {
     let claimed = 0;
     let ready = 0;
-    let pendingAction = 0;
+    let provenWaiting = 0;
+    let unproven = 0;
     let otherOrError = 0;
 
     for (const r of results) {
       if (r.withdrawal) {
-        if (r.withdrawal.portalFinalized || r.withdrawal.status === 'finalized') {
+        const meta = getWithdrawalProveDisplayMeta(r.withdrawal);
+        if (meta.stateKind === 'finalized') {
           claimed += 1;
         } else if (r.withdrawal.status === 'ready-to-finalize') {
           ready += 1;
+        } else if (meta.isProven) {
+          provenWaiting += 1;
         } else {
-          pendingAction += 1;
+          unproven += 1;
         }
       } else {
         otherOrError += 1;
@@ -182,7 +193,8 @@ export function WithdrawalVerificationSection({
       total: results.length,
       claimed,
       ready,
-      pendingAction,
+      provenWaiting,
+      unproven,
       otherOrError,
     };
   }, [results]);
@@ -191,22 +203,24 @@ export function WithdrawalVerificationSection({
     const q = searchQuery.trim().toLowerCase();
     return results.filter((r) => {
       if (filterMode === 'claimed') {
-        if (!r.withdrawal || (!r.withdrawal.portalFinalized && r.withdrawal.status !== 'finalized')) {
+        if (!r.withdrawal) return false;
+        if (getWithdrawalProveDisplayMeta(r.withdrawal).stateKind !== 'finalized') {
           return false;
         }
       } else if (filterMode === 'ready') {
         if (!r.withdrawal || r.withdrawal.status !== 'ready-to-finalize') {
           return false;
         }
-      } else if (filterMode === 'pending_action') {
-        if (
-          !r.withdrawal ||
-          r.withdrawal.portalFinalized ||
-          r.withdrawal.status === 'finalized' ||
-          r.withdrawal.status === 'ready-to-finalize'
-        ) {
+      } else if (filterMode === 'proven_waiting') {
+        if (!r.withdrawal) return false;
+        const meta = getWithdrawalProveDisplayMeta(r.withdrawal);
+        if (!meta.isProven || meta.stateKind === 'finalized' || r.withdrawal.status === 'ready-to-finalize') {
           return false;
         }
+      } else if (filterMode === 'unproven') {
+        if (!r.withdrawal) return false;
+        const meta = getWithdrawalProveDisplayMeta(r.withdrawal);
+        if (meta.isProven) return false;
       } else if (filterMode === 'other_or_error') {
         if (r.withdrawal !== null) return false;
       }
@@ -451,39 +465,45 @@ export function WithdrawalVerificationSection({
         </section>
       ) : (
         <div className="space-y-4">
-          {/* 4-column Summary Strip */}
+          {/* 4-column Summary Strip separating 未Prove vs Prove済 vs 受取完了 */}
           <div className="bg-white border border-slate-200 rounded-xl grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-100">
             <div className="p-4">
-              <div className="text-xs font-medium text-slate-500">検証済みTx合計</div>
+              <div className="text-xs font-medium text-slate-500">検証済み合計</div>
               <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-slate-900">
                 {counts.total.toLocaleString()}
-                <span className="text-xs font-sans font-normal text-slate-500 ml-1">件</span>
-              </div>
-            </div>
-            <div className="p-4">
-              <div className="text-xs font-medium text-emerald-700">
-                L1出金完了済 (Claim済)
-              </div>
-              <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-emerald-700">
-                {counts.claimed.toLocaleString()}
-                <span className="text-xs font-sans font-normal text-slate-500 ml-1">件</span>
-              </div>
-            </div>
-            <div className="p-4">
-              <div className="text-xs font-medium text-[#0052FF]">
-                L1出金実行可能 / 成熟待機中
-              </div>
-              <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-slate-900">
-                {(counts.ready + counts.pendingAction).toLocaleString()}
                 <span className="text-xs font-sans font-normal text-slate-500 ml-1">
-                  (即Claim可: {counts.ready})
+                  件{counts.otherOrError > 0 ? ` (非出金/Err: ${counts.otherOrError})` : ''}
                 </span>
               </div>
             </div>
             <div className="p-4">
-              <div className="text-xs font-medium text-slate-600">非出金Tx / 未検出・エラー</div>
+              <div className="text-xs font-medium text-amber-700">
+                未Prove (出金証明 未提出)
+              </div>
+              <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-amber-700">
+                {counts.unproven.toLocaleString()}
+                <span className="text-xs font-sans font-normal text-slate-500 ml-1">
+                  件 (要Prove)
+                </span>
+              </div>
+            </div>
+            <div className="p-4">
+              <div className="text-xs font-medium text-[#0052FF]">
+                Prove済 ✓ (ロック待機 / 受取可)
+              </div>
               <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-slate-900">
-                {counts.otherOrError.toLocaleString()}
+                {(counts.provenWaiting + counts.ready).toLocaleString()}
+                <span className="text-xs font-sans font-normal text-emerald-700 ml-1 font-semibold">
+                  (即受取可: {counts.ready})
+                </span>
+              </div>
+            </div>
+            <div className="p-4">
+              <div className="text-xs font-medium text-emerald-700">
+                Prove済 · L1資金受取完了
+              </div>
+              <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-emerald-700">
+                {counts.claimed.toLocaleString()}
                 <span className="text-xs font-sans font-normal text-slate-500 ml-1">件</span>
               </div>
             </div>
@@ -531,25 +551,36 @@ export function WithdrawalVerificationSection({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setFilterMode('pending_action')}
+                  onClick={() => setFilterMode('unproven')}
                   className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer tabular-nums ${
-                    filterMode === 'pending_action'
-                      ? 'bg-white text-slate-900 shadow-xs'
+                    filterMode === 'unproven'
+                      ? 'bg-white text-amber-800 shadow-xs'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  L1出金未実行・待機 ({counts.pendingAction})
+                  未Prove ({counts.unproven})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterMode('proven_waiting')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer tabular-nums ${
+                    filterMode === 'proven_waiting'
+                      ? 'bg-white text-[#0052FF] shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Prove済・待機中 ({counts.provenWaiting})
                 </button>
                 <button
                   type="button"
                   onClick={() => setFilterMode('ready')}
                   className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer tabular-nums ${
                     filterMode === 'ready'
-                      ? 'bg-white text-slate-900 shadow-xs'
+                      ? 'bg-white text-emerald-700 shadow-xs'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  今すぐClaim可能 ({counts.ready})
+                  Prove済・受取可 ({counts.ready})
                 </button>
                 <button
                   type="button"
@@ -560,7 +591,7 @@ export function WithdrawalVerificationSection({
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  L1出金完了済 ({counts.claimed})
+                  資金受取完了 ({counts.claimed})
                 </button>
                 {counts.otherOrError > 0 && (
                   <button
@@ -635,7 +666,7 @@ export function WithdrawalVerificationSection({
                   <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold text-slate-500">
                     <th className="py-2.5 pl-4 pr-2 w-10 text-right tabular-nums">#</th>
                     <th className="py-2.5 px-3">L2 出金Txハッシュ</th>
-                    <th className="py-2.5 px-3">Prove状態 / L1ステージ</th>
+                    <th className="py-2.5 px-3">L1 Prove (出金証明) 状態</th>
                     <th className="py-2.5 px-3">待機後の実出金検証</th>
                     <th className="py-2.5 px-3 text-right">出金額</th>
                     <th className="py-2.5 px-3 text-right">出金可能残り時間</th>
@@ -655,6 +686,7 @@ export function WithdrawalVerificationSection({
                     filteredResults.map((row) => {
                       const w = row.withdrawal;
                       const val = w?.validation;
+                      const proveMeta = w ? getWithdrawalProveDisplayMeta(w) : null;
                       const isSelected = selectedHash === row.hash;
                       const isValidHex = /^0x[0-9a-fA-F]{64}$/.test(row.hash);
                       const remainingSec = w
@@ -711,33 +743,58 @@ export function WithdrawalVerificationSection({
                             </div>
                           </td>
                           <td className="py-2 px-3 whitespace-nowrap">
-                            {w ? (
-                              <div>
-                                <div
-                                  className={`font-semibold ${
-                                    w.status === 'finalized' || w.status === 'ready-to-finalize'
-                                      ? 'text-emerald-700'
-                                      : w.status === 'ready-to-prove'
-                                      ? 'text-[#0052FF]'
-                                      : 'text-amber-700'
-                                  }`}
-                                >
-                                  {getWithdrawalStatusLabel(w.status)}
+                            {w && proveMeta ? (
+                              <div title={proveMeta.headline}>
+                                <div className="flex items-center gap-1.5">
+                                  {proveMeta.isProven ? (
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                  ) : proveMeta.stateKind === 'reprove' ? (
+                                    <AlertTriangle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                                  ) : (
+                                    <Clock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                                  )}
+                                  <span
+                                    className={`font-bold ${
+                                      proveMeta.isProven
+                                        ? 'text-emerald-700'
+                                        : proveMeta.stateKind === 'reprove'
+                                        ? 'text-red-700'
+                                        : 'text-amber-800'
+                                    }`}
+                                  >
+                                    {proveMeta.isProven
+                                      ? `Prove済 ✓${
+                                          val && val.numProofSubmitters > 0
+                                            ? ` (${val.numProofSubmitters}件)`
+                                            : ''
+                                        }`
+                                      : proveMeta.stateKind === 'reprove'
+                                      ? '要再Prove'
+                                      : '未Prove (未提出)'}
+                                  </span>
+                                  {val?.l1ProveTxHash && networkConfig.l1ExplorerUrl && (
+                                    <a
+                                      href={`${networkConfig.l1ExplorerUrl}/tx/${val.l1ProveTxHash}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      onClick={(e) => e.stopPropagation()}
+                                      title={`EtherscanでL1 Proveトランザクション (${val.l1ProveTxHash}) を確認`}
+                                      className="inline-flex items-center gap-0.5 text-[10px] font-mono text-[#0052FF] hover:underline"
+                                    >
+                                      <span>ProveTx</span>
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
                                 </div>
-                                <div className="text-[11px] font-mono text-slate-500">
-                                  {val
-                                    ? `${
-                                        val.numProofSubmitters > 0
-                                          ? `Prove済(${val.numProofSubmitters})`
-                                          : '未Prove'
-                                      } · ${
-                                        val.teeZk?.windowMode === 'dual-1d'
+                                <div className="text-[11px] font-mono text-slate-600 mt-0.5">
+                                  {getWithdrawalStatusLabel(w.status)}
+                                  {val?.teeZk
+                                    ? ` · ${
+                                        val.teeZk.windowMode === 'dual-1d'
                                           ? 'TEE+ZK 1日枠'
-                                          : '単一証明 5日枠'
+                                          : '単一 5日枠'
                                       }`
-                                    : w.portalFinalized
-                                    ? '資金受取済'
-                                    : '未Prove'}
+                                    : ''}
                                 </div>
                               </div>
                             ) : row.errorReason ? (

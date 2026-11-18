@@ -32,6 +32,7 @@ import {
 } from '../lib/exportUtils';
 import {
   formatSecondsJapanese,
+  getWithdrawalProveDisplayMeta,
   getWithdrawalStatusLabel,
 } from '../lib/withdrawalAnalyzer';
 
@@ -196,37 +197,41 @@ export function VerificationTable({
 
   const renderFinalityCell = (row: VerifiedTransactionResult) => {
     if (row.withdrawal) {
+      const proveMeta = getWithdrawalProveDisplayMeta(row.withdrawal);
       if (row.withdrawal.portalFinalized) {
         return (
           <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 whitespace-nowrap">
             <ShieldCheck className="w-4 h-4 shrink-0" />
-            <span>L1出金完了 (Claim済)</span>
+            <span>Prove済 ✓ · L1出金完了</span>
           </span>
         );
       }
-      if (row.finality === FinalityStage.FINALIZED) {
+      const l2StageText =
+        row.finality === FinalityStage.FINALIZED
+          ? 'L2確定'
+          : row.finality === FinalityStage.SAFE
+          ? 'L2 Safe'
+          : 'L2 Unsafe';
+
+      if (proveMeta.isProven) {
         return (
           <span
-            className="inline-flex items-center gap-1.5 text-xs font-semibold text-sky-700 whitespace-nowrap"
-            title="L2ブロックはL1確定済みですが、L1のfinalizeWithdrawalTransactionは未実行です"
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 whitespace-nowrap"
+            title={proveMeta.headline}
           >
-            <Layers className="w-4 h-4 shrink-0" />
-            <span>L2確定 · L1出金未実行</span>
+            <ShieldCheck className="w-4 h-4 shrink-0" />
+            <span>{l2StageText} · {proveMeta.shortBadge}</span>
           </span>
         );
       }
-      if (row.finality === FinalityStage.SAFE) {
-        return (
-          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-sky-700 whitespace-nowrap">
-            <Layers className="w-4 h-4 shrink-0" />
-            <span>L2 Safe · L1出金未実行</span>
-          </span>
-        );
-      }
+
       return (
-        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700 whitespace-nowrap">
+        <span
+          className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700 whitespace-nowrap"
+          title={proveMeta.headline}
+        >
           <Clock className="w-4 h-4 shrink-0" />
-          <span>L2 Unsafe · L1出金未実行</span>
+          <span>{l2StageText} · {proveMeta.shortBadge}</span>
         </span>
       );
     }
@@ -703,28 +708,39 @@ export function VerificationTable({
                         {row.withdrawal ? (
                           row.withdrawal.status === 'finalized' ? (
                             <span className="text-emerald-700 font-semibold">
-                              L1出金完了済
+                              Prove済 · 受取完了
                             </span>
                           ) : row.withdrawal.status === 'ready-to-finalize' ? (
                             <span className="text-emerald-700 font-semibold">
-                              0秒 (出金実行可)
+                              Prove済 ✓ · 0秒 (受取可)
                             </span>
                           ) : (
-                            <span
-                              className="text-amber-700 font-medium"
-                              title={getWithdrawalStatusLabel(row.withdrawal.status)}
-                            >
-                              {row.withdrawal.estimatedClaimableAtMs
-                                ? formatSecondsJapanese(
-                                    Math.max(
-                                      0,
-                                      Math.ceil(
-                                        (row.withdrawal.estimatedClaimableAtMs - nowMs) / 1000
+                            <div>
+                              <span
+                                className="text-amber-700 font-medium"
+                                title={getWithdrawalStatusLabel(row.withdrawal.status)}
+                              >
+                                {row.withdrawal.estimatedClaimableAtMs
+                                  ? formatSecondsJapanese(
+                                      Math.max(
+                                        0,
+                                        Math.ceil(
+                                          (row.withdrawal.estimatedClaimableAtMs - nowMs) / 1000
+                                        )
                                       )
                                     )
-                                  )
-                                : formatSecondsJapanese(row.withdrawal.totalSecondsRemaining)}
-                            </span>
+                                  : formatSecondsJapanese(row.withdrawal.totalSecondsRemaining)}
+                              </span>
+                              <div
+                                className={`text-[10px] font-sans font-semibold ${
+                                  getWithdrawalProveDisplayMeta(row.withdrawal).isProven
+                                    ? 'text-emerald-700'
+                                    : 'text-amber-700'
+                                }`}
+                              >
+                                {getWithdrawalProveDisplayMeta(row.withdrawal).shortBadge}
+                              </div>
+                            </div>
                           )
                         ) : (
                           <span className="text-slate-400">—</span>

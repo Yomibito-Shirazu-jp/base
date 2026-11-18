@@ -28,6 +28,7 @@ import {
 } from '../lib/exportUtils';
 import {
   formatSecondsJapanese,
+  getWithdrawalProveDisplayMeta,
   getWithdrawalStatusLabel,
   simulateWithdrawalOnL1,
 } from '../lib/withdrawalAnalyzer';
@@ -368,10 +369,34 @@ export function TxInspectorDrawer({
                       </div>
                     </div>
                     <div>
-                      <div className="text-[11px] text-slate-500">現在の L1 進行段階</div>
-                      <div className="mt-0.5 text-xs font-semibold text-slate-900">
-                        {getWithdrawalStatusLabel(w.status)}
+                      <div className="text-[11px] text-slate-500">
+                        L1 Prove（出金証明）状態
                       </div>
+                      {(() => {
+                        const meta = getWithdrawalProveDisplayMeta(w);
+                        return (
+                          <>
+                            <div
+                              className={`mt-0.5 text-sm font-bold ${
+                                meta.isProven
+                                  ? 'text-emerald-700'
+                                  : meta.stateKind === 'reprove'
+                                  ? 'text-red-700'
+                                  : 'text-amber-800'
+                              }`}
+                            >
+                              {meta.isProven
+                                ? 'Prove済 ✓'
+                                : meta.stateKind === 'reprove'
+                                ? '要再Prove'
+                                : '未Prove（未提出）'}
+                            </div>
+                            <div className="text-[11px] text-slate-600">
+                              {getWithdrawalStatusLabel(w.status)}
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
                     <div>
                       <div className="text-[11px] text-slate-500">出金可能まで残り</div>
@@ -496,12 +521,47 @@ export function TxInspectorDrawer({
                       <span className="font-sans text-slate-500">
                         L1 Prove 状態 (numProofSubmitters)
                       </span>
-                      <span className="text-slate-900 font-semibold text-right">
+                      <span
+                        className={`font-semibold text-right ${
+                          getWithdrawalProveDisplayMeta(w).isProven
+                            ? 'text-emerald-700'
+                            : 'text-amber-800'
+                        }`}
+                      >
                         {val
-                          ? `${val.numProofSubmitters}件 (${val.proveStateLabel.split('（')[0]})`
-                          : '—'}
+                          ? val.numProofSubmitters > 0
+                            ? `Prove済 ✓ (${val.numProofSubmitters}件登録)`
+                            : '未Prove (0件 · 証明未提出)'
+                          : getWithdrawalProveDisplayMeta(w).shortBadge}
                       </span>
                     </div>
+                    {val?.provenTimestamp && (
+                      <div className="flex justify-between gap-2">
+                        <span className="font-sans text-slate-500">Prove 提出日時 (L1)</span>
+                        <span className="tabular-nums">
+                          {formatUnixTimestamp(val.provenTimestamp)}
+                        </span>
+                      </div>
+                    )}
+                    {val?.l1ProveTxHash && (
+                      <div className="flex justify-between items-center gap-2">
+                        <span className="font-sans text-slate-500">L1 Prove Tx Hash</span>
+                        <span className="inline-flex items-center gap-1 truncate">
+                          <span className="truncate">{val.l1ProveTxHash}</span>
+                          {l1ExplorerUrl && (
+                            <a
+                              href={`${l1ExplorerUrl}/tx/${val.l1ProveTxHash}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-[#0052FF] hover:underline shrink-0"
+                              aria-label="EtherscanでProveトランザクションを表示"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          )}
+                        </span>
+                      </div>
+                    )}
                     {val?.proofSubmitter && (
                       <div className="flex justify-between gap-2">
                         <span className="font-sans text-slate-500">Prove 提出アドレス</span>

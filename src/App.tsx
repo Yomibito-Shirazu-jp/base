@@ -18,7 +18,11 @@ import {
   parseTxHashes,
   verifyTransactionsBatch,
 } from './lib/baseRpc';
-import { fetchRecentWithdrawalSamples } from './lib/withdrawalAnalyzer';
+import type { Hex } from 'viem';
+import {
+  analyzeWithdrawalFromTxHash,
+  fetchRecentWithdrawalSamples,
+} from './lib/withdrawalAnalyzer';
 import {
   clearFinalizedCache,
   getAllCachedFinalizedResults,
@@ -699,6 +703,74 @@ export default function App() {
   useEffect(() => {
     refreshHead();
   }, [refreshHead]);
+
+  // Refresh L1 Prove/Finalize status of any restored unclaimed withdrawals on session load
+  const didAutoRefreshRestoredWithdrawalsRef = useRef(false);
+  useEffect(() => {
+    if (didAutoRefreshRestoredWithdrawalsRef.current) return;
+    if (activeNetworkConfig.rpcUrls.length === 0) return;
+
+    const activeHashes = new Set<string>();
+    for (const r of results) {
+      if (r.withdrawal && !r.withdrawal.portalFinalized) {
+        activeHashes.add(r.hash.toLowerCase());
+      }
+    }
+    for (const r of withdrawalVerifyResults) {
+      if (r.withdrawal && !r.withdrawal.portalFinalized) {
+        activeHashes.add(r.hash.toLowerCase());
+      }
+    }
+
+    if (activeHashes.size === 0) return;
+    didAutoRefreshRestoredWithdrawalsRef.current = true;
+
+    let cancelled = false;
+    (async () => {
+      const updates = new Map<string, VerifiedTransactionResult['withdrawal']>();
+      await Promise.all(
+        Array.from(activeHashes)
+          .slice(0, 10)
+          .map(async (h) => {
+            try {
+              const refreshed = await analyzeWithdrawalFromTxHash(
+                h as Hex,
+                activeNetworkConfig
+              );
+              if (refreshed) {
+                updates.set(h, refreshed);
+              }
+            } catch {
+              // Keep existing snapshot if offline
+            }
+          })
+      );
+
+      if (cancelled || updates.size === 0) return;
+
+      setResults((prev) =>
+        prev.map((row) => {
+          const nextW = updates.get(row.hash.toLowerCase());
+          return nextW ? { ...row, withdrawal: nextW } : row;
+        })
+      );
+      setWithdrawalVerifyResults((prev) =>
+        prev.map((row) => {
+          const nextW = updates.get(row.hash.toLowerCase());
+          return nextW ? { ...row, withdrawal: nextW } : row;
+        })
+      );
+      setSelectedResult((prev) => {
+        if (!prev) return null;
+        const nextW = updates.get(prev.hash.toLowerCase());
+        return nextW ? { ...prev, withdrawal: nextW } : prev;
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeNetworkConfig, results, withdrawalVerifyResults]);
 
   const mergeWithdrawalsIntoTab = useCallback(
     (rows: VerifiedTransactionResult[], snap: ChainHeadSnapshot) => {

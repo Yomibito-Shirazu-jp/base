@@ -187,6 +187,8 @@ export interface WithdrawalValidationReport {
   disputeGameResolvedAt: number | null;
   disputeGameBlacklisted: boolean | null;
   provenTimestamp: number | null;
+  l1ProveTxHash?: string | null;
+  l1ProveBlockNumber?: number | null;
   maturityRemainingSeconds: number | null;
   gameResolutionRemainingSeconds: number | null;
   checkWithdrawalPassed: boolean | null;

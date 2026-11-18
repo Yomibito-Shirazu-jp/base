@@ -19,9 +19,10 @@ import {
   LiveWithdrawalConditions,
   analyzeWithdrawalFromTxHash,
   fetchLiveWithdrawalConditions,
+  fetchRecentProvenWithdrawalSample,
   fetchRecentWithdrawalSamples,
   formatSecondsJapanese,
-  getProveLifecycleBadgeText,
+  getWithdrawalProveDisplayMeta,
   getWithdrawalStatusLabel,
   inspectLatestDisputeGameTeeZk,
   simulateWithdrawalOnL1,
@@ -43,6 +44,7 @@ export function WithdrawalSimulatorSection({
   const [txHashInput, setTxHashInput] = useState(initialTxHash ?? '');
   const [isAnalyzingTx, setIsAnalyzingTx] = useState(false);
   const [isLoadingSample, setIsLoadingSample] = useState(false);
+  const [isLoadingProvenSample, setIsLoadingProvenSample] = useState(false);
   const [txError, setTxError] = useState<string | null>(null);
   const [withdrawalInfo, setWithdrawalInfo] = useState<WithdrawalInfo | null>(
     null
@@ -193,6 +195,28 @@ export function WithdrawalSimulatorSection({
     }
   };
 
+  const handleFetchProvenSample = async () => {
+    setIsLoadingProvenSample(true);
+    setTxError(null);
+    try {
+      const provenTx = await fetchRecentProvenWithdrawalSample(networkConfig);
+      if (!provenTx) {
+        setTxError(
+          '直近のL1ブロック範囲から Prove済 の出金トランザクションを自動検出できませんでした（任意の出金Txハッシュを直接貼り付けて確認できます）'
+        );
+        return;
+      }
+      setTxHashInput(provenTx);
+      await runTxAnalysisAndSimulation(provenTx);
+    } catch (err) {
+      setTxError(
+        err instanceof Error ? err.message : 'Prove済サンプルの検索に失敗しました'
+      );
+    } finally {
+      setIsLoadingProvenSample(false);
+    }
+  };
+
   // Compute live ticking remaining seconds for the analyzed tx
   const liveRemainingSeconds = useMemo(() => {
     if (!withdrawalInfo) return null;
@@ -301,19 +325,34 @@ export function WithdrawalSimulatorSection({
               シミュレーションを実行し、そのまま <strong>「資金を受け取る」</strong> ボタンで着金できます。
             </p>
           </div>
-          <button
-            type="button"
-            onClick={handleFetchLatestSample}
-            disabled={isLoadingSample || isAnalyzingTx}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <RefreshCw
-              className={`w-3.5 h-3.5 ${isLoadingSample ? 'animate-spin' : ''}`}
-            />
-            <span>
-              {isLoadingSample ? '検索中...' : '最新出金Txをオンチェーン取得'}
-            </span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleFetchProvenSample}
+              disabled={isLoadingProvenSample || isLoadingSample || isAnalyzingTx}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${isLoadingProvenSample ? 'animate-spin' : ''}`}
+              />
+              <span>
+                {isLoadingProvenSample ? 'Prove済Tx検索中...' : 'Prove済の出金Txサンプルを取得'}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={handleFetchLatestSample}
+              disabled={isLoadingSample || isLoadingProvenSample || isAnalyzingTx}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${isLoadingSample ? 'animate-spin' : ''}`}
+              />
+              <span>
+                {isLoadingSample ? '検索中...' : '最新の出金Txを取得'}
+              </span>
+            </button>
+          </div>
         </div>
 
         {/* Detected withdrawal shortcuts from batch / withdrawal tables */}
@@ -322,26 +361,48 @@ export function WithdrawalSimulatorSection({
             <span className="text-slate-500 font-medium">
               検証済みの出金Txを選択:
             </span>
-            {verifiedWithdrawals.map((item) => (
-              <button
-                key={item.hash}
-                type="button"
-                onClick={() => {
-                  setTxHashInput(item.hash);
-                  runTxAnalysisAndSimulation(item.hash);
-                }}
-                className={`px-2.5 py-1 font-mono text-xs rounded-md transition-colors cursor-pointer ${
-                  txHashInput.toLowerCase() === item.hash.toLowerCase()
-                    ? 'bg-[#0052FF] text-white'
-                    : 'bg-slate-100 hover:bg-slate-200 text-slate-800'
-                }`}
-              >
-                {shortenHex(item.hash, 8, 6)}
-                {item.withdrawal
-                  ? ` (${item.withdrawal.amountFormatted} ${item.withdrawal.assetSymbol})`
-                  : ''}
-              </button>
-            ))}
+            {verifiedWithdrawals.map((item) => {
+              const meta = item.withdrawal
+                ? getWithdrawalProveDisplayMeta(item.withdrawal)
+                : null;
+              const isActive =
+                txHashInput.toLowerCase() === item.hash.toLowerCase();
+              return (
+                <button
+                  key={item.hash}
+                  type="button"
+                  onClick={() => {
+                    setTxHashInput(item.hash);
+                    runTxAnalysisAndSimulation(item.hash);
+                  }}
+                  className={`px-2.5 py-1 font-mono text-xs rounded-md transition-colors cursor-pointer inline-flex items-center gap-1.5 ${
+                    isActive
+                      ? 'bg-[#0052FF] text-white'
+                      : 'bg-slate-100 hover:bg-slate-200 text-slate-800'
+                  }`}
+                >
+                  <span>
+                    {shortenHex(item.hash, 8, 6)}
+                    {item.withdrawal
+                      ? ` (${item.withdrawal.amountFormatted} ${item.withdrawal.assetSymbol})`
+                      : ''}
+                  </span>
+                  {meta && (
+                    <span
+                      className={`font-sans font-semibold text-[11px] ${
+                        isActive
+                          ? 'text-white/95'
+                          : meta.isProven
+                          ? 'text-emerald-700'
+                          : 'text-amber-800'
+                      }`}
+                    >
+                      [{meta.isProven ? 'Prove済' : '未Prove'}]
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
         )}
 
@@ -425,20 +486,40 @@ export function WithdrawalSimulatorSection({
               <div className="p-4">
                 <div className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                   <ShieldCheck className="w-3.5 h-3.5" />
-                  <span>ステージ / ゲーム待機枠</span>
+                  <span>L1 Prove（出金証明）状態</span>
                 </div>
-                <div className="mt-1.5 text-sm font-bold text-slate-900">
-                  {getWithdrawalStatusLabel(withdrawalInfo.status)}
-                </div>
-                <div className="mt-1 text-xs text-[#0052FF] font-medium truncate">
-                  {withdrawalInfo.validation?.teeZk?.windowMode === 'dual-1d'
-                    ? 'TEE+ZK 二重証明 (1日枠)'
-                    : withdrawalInfo.validation
-                    ? `${getProveLifecycleBadgeText(
-                        withdrawalInfo.validation.proveState
-                      )} · 単一5日枠`
-                    : '—'}
-                </div>
+                {(() => {
+                  const meta = getWithdrawalProveDisplayMeta(withdrawalInfo);
+                  return (
+                    <>
+                      <div
+                        className={`mt-1.5 text-lg font-bold ${
+                          meta.isProven
+                            ? 'text-emerald-700'
+                            : meta.stateKind === 'reprove'
+                            ? 'text-red-700'
+                            : 'text-amber-800'
+                        }`}
+                      >
+                        {meta.isProven
+                          ? 'Prove済 ✓'
+                          : meta.stateKind === 'reprove'
+                          ? '要再Prove'
+                          : '未Prove（未提出）'}
+                      </div>
+                      <div className="mt-1 text-xs text-slate-600 font-medium truncate">
+                        {getWithdrawalStatusLabel(withdrawalInfo.status)}
+                        {withdrawalInfo.validation?.teeZk
+                          ? ` · ${
+                              withdrawalInfo.validation.teeZk.windowMode === 'dual-1d'
+                                ? 'TEE+ZK 1日枠'
+                                : '単一 5日枠'
+                            }`
+                          : ''}
+                      </div>
+                    </>
+                  );
+                })()}
               </div>
 
               <div className="p-4">

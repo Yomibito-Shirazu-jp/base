@@ -80,6 +80,10 @@ export const OPTIMISM_PORTAL_READ_ABI = parseAbi([
   'function proveWithdrawalTransaction((uint256 nonce, address sender, address target, uint256 value, uint256 gasLimit, bytes data) _tx, uint256 _disputeGameIndex, (bytes32 version, bytes32 stateRoot, bytes32 messagePasserStorageRoot, bytes32 latestBlockhash) _outputRootProof, bytes[] _withdrawalProof)',
 ]);
 
+const OPTIMISM_PORTAL_PROVEN_EVENT_ABI = parseAbi([
+  'event WithdrawalProven(bytes32 indexed withdrawalHash, address indexed from, address indexed to)',
+]);
+
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 const DISPUTE_GAME_FACTORY_ABI = parseAbi([
@@ -855,18 +859,138 @@ export function getDisputeGameStatusText(status: number | null): string {
 export function getProveLifecycleBadgeText(state: ProveLifecycleState): string {
   switch (state) {
     case 'finalized':
-      return 'Prove済 · L1出金完了';
+      return 'Prove済 ✓ · 資金受取完了';
     case 'proven-ready':
-      return 'Prove完了 · 今すぐFinalize可';
+      return 'Prove済 ✓ · 今すぐ受取可';
     case 'proven-waiting':
-      return 'Prove提出済 (待機中)';
+      return 'Prove済 ✓ · ロック待機中';
     case 'invalid-need-reprove':
       return '要再Prove (Game無効)';
     case 'unproven-ready':
-      return '未Prove (今すぐProve可)';
+      return '未Prove · 今すぐProve可';
     case 'unproven-waiting-game':
-      return '未Prove (L1提案待ち)';
+      return '未Prove · L1提案待ち';
   }
+}
+
+export interface ProveDisplayMeta {
+  stateKind: 'finalized' | 'proven' | 'reprove' | 'unproven';
+  isProven: boolean;
+  shortBadge: string;
+  headline: string;
+  subline: string;
+}
+
+export function getWithdrawalProveDisplayMeta(w: WithdrawalInfo): ProveDisplayMeta {
+  const val = w.validation;
+  if (w.portalFinalized || w.status === 'finalized' || val?.proveState === 'finalized') {
+    return {
+      stateKind: 'finalized',
+      isProven: true,
+      shortBadge: 'Prove済 · 受取完了',
+      headline: '【Prove済 ✓】出金証明・L1資金受け取りともに完了済み',
+      subline: 'OptimismPortal2 にて Prove および Finalize の完了を確認しました。',
+    };
+  }
+
+  if (val?.proveState === 'invalid-need-reprove') {
+    return {
+      stateKind: 'reprove',
+      isProven: false,
+      shortBadge: '要再Prove',
+      headline: '【要再Prove】紐づく DisputeGame が無効化されたため再提出が必要です',
+      subline: '有効な最新 DisputeGame に対して再度 proveWithdrawalTransaction を実行してください。',
+    };
+  }
+
+  const provenOnChain =
+    val !== undefined
+      ? val.numProofSubmitters > 0 ||
+        val.proveState === 'proven-ready' ||
+        val.proveState === 'proven-waiting'
+      : w.status === 'waiting-to-finalize' || w.status === 'ready-to-finalize';
+
+  if (provenOnChain) {
+    const readyToClaim =
+      w.status === 'ready-to-finalize' || val?.proveState === 'proven-ready';
+    return {
+      stateKind: 'proven',
+      isProven: true,
+      shortBadge: readyToClaim ? 'Prove済 ✓ (受取可)' : 'Prove済 ✓ (待機中)',
+      headline: readyToClaim
+        ? '【Prove済 ✓】出金証明は提出済み・待機完了（今すぐ資金を受け取れます）'
+        : '【Prove済 ✓】L1 OptimismPortal2 に出金証明が提出済みです（再Prove不要）',
+      subline: readyToClaim
+        ? 'Prove後成熟期間とゲーム待機期間の両方が完了しています。「資金を受け取る」を実行してください。'
+        : '出金証明（proveWithdrawalTransaction）は完了しています。ロック期間満了後に「資金を受け取る」が可能になります。',
+    };
+  }
+
+  const canProveImmediately =
+    w.status === 'ready-to-prove' || val?.proveState === 'unproven-ready';
+  return {
+    stateKind: 'unproven',
+    isProven: false,
+    shortBadge: canProveImmediately ? '未Prove (今すぐ可)' : '未Prove (提案待ち)',
+    headline: canProveImmediately
+      ? '【未Prove】まだ L1 に出金証明（proveWithdrawalTransaction）が提出されていません'
+      : '【未Prove】まだ出金証明は未提出です（L1 DisputeGame 提案到達待ち）',
+    subline: canProveImmediately
+      ? 'L1 DisputeGame 提案に到達済みのため、今すぐ「1. 出金証明を提出 (proveWithdrawalTransaction)」を実行できます。'
+      : '約25〜30分間隔で L1 に DisputeGame が提案されると、出金証明（Prove）の提出が可能になります。',
+  };
+}
+
+async function findL1ProveTransactionByTimestamp(params: {
+  l1Client: ReturnType<typeof createBaseAndL1Clients>['l1Client'];
+  portalAddress: Address;
+  withdrawalHash: Hex;
+  provenTimestamp: number;
+}): Promise<{ txHash: string | null; blockNumber: number | null }> {
+  const { l1Client, portalAddress, withdrawalHash, provenTimestamp } = params;
+  try {
+    const latestBlock = await l1Client.getBlock({ blockTag: 'latest' });
+    const diffSec = Math.max(0, Number(latestBlock.timestamp) - provenTimestamp);
+    let estBlock = latestBlock.number - BigInt(Math.floor(diffSec / 12));
+    if (estBlock < 0n) estBlock = 0n;
+
+    const queryAround = async (center: bigint, radius: bigint) => {
+      const fromBlock = center > radius ? center - radius : 0n;
+      const toBlock =
+        center + radius > latestBlock.number ? latestBlock.number : center + radius;
+      const logs = await l1Client.getLogs({
+        address: portalAddress,
+        event: OPTIMISM_PORTAL_PROVEN_EVENT_ABI[0],
+        args: { withdrawalHash },
+        fromBlock,
+        toBlock,
+      });
+      if (logs.length > 0) {
+        const hit = logs[logs.length - 1];
+        return {
+          txHash: hit.transactionHash ?? null,
+          blockNumber: hit.blockNumber !== null ? Number(hit.blockNumber) : null,
+        };
+      }
+      return null;
+    };
+
+    const firstTry = await queryAround(estBlock, 350n);
+    if (firstTry) return firstTry;
+
+    // Drift correction for older timestamps (missed PoS slots shift ~70 blocks/day)
+    const sampleBlk = await l1Client.getBlock({ blockNumber: estBlock });
+    const driftSec = provenTimestamp - Number(sampleBlk.timestamp);
+    let correctedBlock = estBlock + BigInt(Math.round(driftSec / 12));
+    if (correctedBlock < 0n) correctedBlock = 0n;
+    if (correctedBlock > latestBlock.number) correctedBlock = latestBlock.number;
+
+    const secondTry = await queryAround(correctedBlock, 350n);
+    if (secondTry) return secondTry;
+  } catch {
+    // Non-fatal if RPC caps getLogs
+  }
+  return { txHash: null, blockNumber: null };
 }
 
 async function verifyMessagePasserAndL1Validation(params: {
@@ -1060,6 +1184,8 @@ async function verifyMessagePasserAndL1Validation(params: {
   let disputeGameResolvedAt: number | null = null;
   let disputeGameBlacklisted: boolean | null = null;
   let provenTimestamp: number | null = null;
+  let l1ProveTxHash: string | null = null;
+  let l1ProveBlockNumber: number | null = null;
   let maturityRemainingSeconds: number | null = null;
   let gameResolutionRemainingSeconds: number | null = null;
   let checkWithdrawalPassed: boolean | null = null;
@@ -1178,6 +1304,14 @@ async function verifyMessagePasserAndL1Validation(params: {
       maturityRemainingSeconds = portalFinalized
         ? 0
         : Math.max(0, provenTimestamp + proofMaturityDelaySeconds - nowSec);
+      const proveTxInfo = await findL1ProveTransactionByTimestamp({
+        l1Client,
+        portalAddress,
+        withdrawalHash: primary.withdrawalHash,
+        provenTimestamp,
+      });
+      l1ProveTxHash = proveTxInfo.txHash;
+      l1ProveBlockNumber = proveTxInfo.blockNumber;
     }
     if (portalFinalized) {
       gameResolutionRemainingSeconds = 0;
@@ -1694,6 +1828,8 @@ async function verifyMessagePasserAndL1Validation(params: {
     disputeGameResolvedAt,
     disputeGameBlacklisted,
     provenTimestamp,
+    l1ProveTxHash,
+    l1ProveBlockNumber,
     maturityRemainingSeconds,
     gameResolutionRemainingSeconds,
     checkWithdrawalPassed,
@@ -2327,6 +2463,80 @@ export async function fetchRecentWithdrawalSamples(
   return picks;
 }
 
+export async function fetchRecentProvenWithdrawalSample(
+  config: NetworkConfig
+): Promise<string | null> {
+  const { l1Client, l2Client, portalAddress } = createBaseAndL1Clients(config);
+  const [l1Head, l2Head] = await Promise.all([
+    l1Client.getBlockNumber(),
+    l2Client.getBlockNumber(),
+  ]);
+
+  // Look up recent WithdrawalProven events on L1 OptimismPortal2
+  const l1From = l1Head > 1500n ? l1Head - 1500n : 0n;
+  const provenLogs = await l1Client
+    .getLogs({
+      address: portalAddress,
+      event: OPTIMISM_PORTAL_PROVEN_EVENT_ABI[0],
+      fromBlock: l1From,
+      toBlock: l1Head,
+    })
+    .catch(() => []);
+
+  if (provenLogs.length === 0) return null;
+
+  const targetSet = new Set(
+    provenLogs
+      .slice(-25)
+      .map((l) => l.args.withdrawalHash?.toLowerCase())
+      .filter((h): h is string => Boolean(h))
+  );
+
+  // Scan recent ~3.5 days of Base L2 blocks in parallel windows to match the L2 tx hash
+  const chunkSize = 15000n;
+  const maxChunks = 10;
+  for (let i = 0; i < maxChunks; i += 2) {
+    const batchRanges = [i, i + 1]
+      .map((idx) => {
+        const offset = BigInt(idx) * chunkSize;
+        if (l2Head <= offset) return null;
+        const toBlock = l2Head - offset;
+        const fromBlock = toBlock > chunkSize ? toBlock - chunkSize + 1n : 0n;
+        return { fromBlock, toBlock };
+      })
+      .filter((r): r is { fromBlock: bigint; toBlock: bigint } => r !== null);
+
+    if (batchRanges.length === 0) break;
+
+    const chunkLogsList = await Promise.all(
+      batchRanges.map((r) =>
+        l2Client
+          .getLogs({
+            address: L2_TO_L1_MESSAGE_PASSER as Address,
+            fromBlock: r.fromBlock,
+            toBlock: r.toBlock,
+          })
+          .catch(() => [])
+      )
+    );
+
+    for (const logs of chunkLogsList) {
+      for (let j = logs.length - 1; j >= 0; j -= 1) {
+        const dataLower = logs[j].data.toLowerCase();
+        for (const wHash of targetSet) {
+          if (dataLower.includes(wHash.slice(2))) {
+            if (logs[j].transactionHash) {
+              return logs[j].transactionHash.toLowerCase();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 export function formatSecondsJapanese(totalSec: number | null): string {
   if (totalSec === null) return '—';
   if (totalSec <= 0) return '0秒（実行可能）';
@@ -2346,15 +2556,15 @@ export function formatSecondsJapanese(totalSec: number | null): string {
 export function getWithdrawalStatusLabel(status: WithdrawalStatus): string {
   switch (status) {
     case 'waiting-to-prove':
-      return 'Prove待機中 (L1提案待ち)';
+      return '未Prove · L1提案待ち';
     case 'ready-to-prove':
-      return 'Prove実行可能';
+      return '未Prove · 今すぐProve可能';
     case 'waiting-to-finalize':
-      return '確定待機中 (Game解決/成熟期間)';
+      return 'Prove済 ✓ · ロック期間待機中';
     case 'ready-to-finalize':
-      return '出金確定可能 (Claim可)';
+      return 'Prove済 ✓ · 今すぐ資金受取可';
     case 'finalized':
-      return 'L1出金完了済み';
+      return 'Prove済 ✓ · L1資金受取完了';
   }
 }
 

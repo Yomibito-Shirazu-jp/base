@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Check,
   CheckCircle2,
+  Clock,
   Code2,
   Coins,
   Copy,
@@ -23,6 +24,7 @@ import {
   formatSecondsJapanese,
   getDisputeGameStatusText,
   getProveLifecycleBadgeText,
+  getWithdrawalProveDisplayMeta,
   inspectWithdrawalTeeZkStatus,
   simulateWithdrawalOnL1,
 } from '../lib/withdrawalAnalyzer';
@@ -105,11 +107,15 @@ export function PimlicoExecutionPanel({
     useState<PimlicoAccountPreview | null>(null);
   const [isPreviewingAccount, setIsPreviewingAccount] = useState(false);
 
-  // TEE / ZK live inspection state
+  // TEE / ZK & L1 Prove live inspection state
   const [liveTeeZk, setLiveTeeZk] = useState<TeeZkProofInspection | null>(
     withdrawalInfo.validation?.teeZk ?? null
   );
   const [isCheckingTeeZk, setIsCheckingTeeZk] = useState(false);
+  const [isCheckingProveStatus, setIsCheckingProveStatus] = useState(false);
+  const [lastProveCheckedAtMs, setLastProveCheckedAtMs] = useState<number>(
+    withdrawalInfo.analyzedAtMs
+  );
   const [teeZkError, setTeeZkError] = useState<string | null>(null);
 
   // 2-step L1 Simulation (proveWithdrawalTransaction + post-maturity finalizeWithdrawalTransaction)
@@ -160,6 +166,7 @@ export function PimlicoExecutionPanel({
 
   useEffect(() => {
     setLiveTeeZk(withdrawalInfo.validation?.teeZk ?? null);
+    setLastProveCheckedAtMs(withdrawalInfo.analyzedAtMs);
   }, [withdrawalInfo]);
 
   useEffect(() => {
@@ -185,6 +192,10 @@ export function PimlicoExecutionPanel({
   );
 
   const val = withdrawalInfo.validation;
+  const proveMeta = useMemo(
+    () => getWithdrawalProveDisplayMeta(withdrawalInfo),
+    [withdrawalInfo]
+  );
   const activeTeeZk = liveTeeZk ?? activeSim?.teeZk ?? val?.teeZk ?? null;
 
   const elapsedSecSinceAnalyzed = Math.max(
@@ -277,6 +288,30 @@ export function PimlicoExecutionPanel({
     }
   };
 
+  const handleRefreshProveStatus = async () => {
+    setIsCheckingProveStatus(true);
+    setTeeZkError(null);
+    try {
+      const res = await inspectWithdrawalTeeZkStatus(
+        txHash as Hex,
+        networkConfig
+      );
+      setLiveTeeZk(res.teeZk);
+      setLastProveCheckedAtMs(Date.now());
+      if (res.updatedWithdrawal) {
+        onWithdrawalUpdated?.(res.updatedWithdrawal);
+      }
+    } catch (err) {
+      setTeeZkError(
+        err instanceof Error
+          ? err.message
+          : 'L1 Prove状態のオンチェーン照会に失敗しました'
+      );
+    } finally {
+      setIsCheckingProveStatus(false);
+    }
+  };
+
   const handleCheckTeeZk = async () => {
     setIsCheckingTeeZk(true);
     setTeeZkError(null);
@@ -286,6 +321,7 @@ export function PimlicoExecutionPanel({
         networkConfig
       );
       setLiveTeeZk(res.teeZk);
+      setLastProveCheckedAtMs(Date.now());
       if (res.updatedWithdrawal) {
         onWithdrawalUpdated?.(res.updatedWithdrawal);
       }
@@ -394,24 +430,233 @@ export function PimlicoExecutionPanel({
 
   return (
     <div className="border border-slate-200 rounded-xl bg-white divide-y divide-slate-100">
+      {/* Section 0: Unmistakable L1 Prove Status Verdict & 3-Step Withdrawal Progress */}
+      <div className="p-4 sm:p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+          <div>
+            <div className="text-xs font-semibold text-slate-500">
+              あなたの出金の L1 Prove（出金証明）ステータス判定
+            </div>
+            <div
+              className={`mt-1 flex items-center gap-2 text-base font-bold ${
+                proveMeta.isProven
+                  ? 'text-emerald-700'
+                  : proveMeta.stateKind === 'reprove'
+                  ? 'text-red-700'
+                  : 'text-amber-800'
+              }`}
+            >
+              {proveMeta.isProven ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+              ) : proveMeta.stateKind === 'reprove' ? (
+                <AlertTriangle className="w-5 h-5 text-red-600 shrink-0" />
+              ) : (
+                <Clock className="w-5 h-5 text-amber-600 shrink-0" />
+              )}
+              <span>{proveMeta.headline}</span>
+            </div>
+            <p className="mt-1 text-xs text-slate-600 leading-relaxed">
+              {proveMeta.subline}
+            </p>
+          </div>
+
+          <div className="flex flex-col items-start sm:items-end gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={handleRefreshProveStatus}
+              disabled={isCheckingProveStatus || isCheckingTeeZk}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-900 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${
+                  isCheckingProveStatus ? 'animate-spin' : ''
+                }`}
+              />
+              <span>
+                {isCheckingProveStatus
+                  ? 'L1 Prove状態を照会中...'
+                  : 'Prove状態をオンチェーン再確認'}
+              </span>
+            </button>
+            <span className="text-[11px] font-mono tabular-nums text-slate-500">
+              最終照会: {formatUnixTimestamp(Math.floor(lastProveCheckedAtMs / 1000))}
+            </span>
+          </div>
+        </div>
+
+        {/* 3-Step Horizontal L2->L1 Progress Tracker */}
+        <div className="border border-slate-200 rounded-xl grid grid-cols-1 md:grid-cols-3 divide-y md:divide-y-0 md:divide-x divide-slate-100">
+          {/* Step 1: Base L2 Withdrawal Initiated */}
+          <div className="p-3.5 space-y-1 bg-emerald-50/30">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="font-semibold text-slate-700">
+                STEP 1 · Base L2 出金開始
+              </span>
+              <span className="font-bold text-emerald-700 inline-flex items-center gap-1">
+                <Check className="w-3.5 h-3.5" />
+                <span>完了</span>
+              </span>
+            </div>
+            <div className="text-xs font-mono text-slate-700">
+              {withdrawalInfo.amountFormatted} {withdrawalInfo.assetSymbol}
+            </div>
+            <div className="text-[11px] font-mono text-slate-500 truncate">
+              MessagePasser記録: {val?.messagePasser.sentMessageRecorded !== false ? '確認済 ✓' : '未確認'}
+            </div>
+          </div>
+
+          {/* Step 2: Ethereum L1 Prove */}
+          <div
+            className={`p-3.5 space-y-1 ${
+              proveMeta.isProven
+                ? 'bg-emerald-50/50'
+                : proveMeta.stateKind === 'reprove'
+                ? 'bg-red-50/50'
+                : 'bg-amber-50/50'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="font-semibold text-slate-900">
+                STEP 2 · L1 出金証明 (Prove)
+              </span>
+              <span
+                className={`font-bold whitespace-nowrap ${
+                  proveMeta.isProven
+                    ? 'text-emerald-700'
+                    : proveMeta.stateKind === 'reprove'
+                    ? 'text-red-700'
+                    : 'text-amber-800'
+                }`}
+              >
+                {proveMeta.isProven
+                  ? 'Prove済 ✓'
+                  : proveMeta.stateKind === 'reprove'
+                  ? '要再Prove'
+                  : '未Prove (未提出)'}
+              </span>
+            </div>
+
+            {proveMeta.isProven ? (
+              <div className="space-y-0.5 text-[11px] font-mono text-slate-700">
+                <div>
+                  登録数: {val?.numProofSubmitters && val.numProofSubmitters > 0 ? `${val.numProofSubmitters}件` : '確認済'}
+                  {val?.provenTimestamp
+                    ? ` · ${formatUnixTimestamp(val.provenTimestamp)}`
+                    : ''}
+                </div>
+                {val?.proofSubmitter && (
+                  <div className="flex items-center gap-1 truncate">
+                    <span>提出者: {shortenHex(val.proofSubmitter, 8, 6)}</span>
+                    <button
+                      type="button"
+                      onClick={() => copyValue('submitter', val.proofSubmitter!)}
+                      className="text-slate-400 hover:text-slate-700 cursor-pointer shrink-0"
+                      aria-label="Prove提出者アドレスをコピー"
+                    >
+                      {copiedField === 'submitter' ? (
+                        <Check className="w-3 h-3 text-emerald-600" />
+                      ) : (
+                        <Copy className="w-3 h-3" />
+                      )}
+                    </button>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-2">
+                  <span>
+                    1日成熟:{' '}
+                    {liveMaturityRemSec === 0
+                      ? '完了 ✓'
+                      : `残り ${formatSecondsJapanese(liveMaturityRemSec)}`}
+                  </span>
+                  {val?.l1ProveTxHash && networkConfig.l1ExplorerUrl && (
+                    <a
+                      href={`${networkConfig.l1ExplorerUrl}/tx/${val.l1ProveTxHash}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-0.5 font-sans font-semibold text-[#0052FF] hover:underline shrink-0"
+                    >
+                      <span>L1 Prove Tx</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-0.5 text-[11px] text-slate-700">
+                <div className="font-mono text-amber-900">
+                  numProofSubmitters = {val?.numProofSubmitters ?? 0} (証明記録なし)
+                </div>
+                <div>
+                  {canProveNow
+                    ? '今すぐ下の「1. 出金証明を提出」ボタンからProveを実行できます'
+                    : `L1 DisputeGame 提案待ち（残り目安 ${formatSecondsJapanese(
+                        withdrawalInfo.secondsToProve
+                      )}）`}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Step 3: Ethereum L1 Finalize / Receive Funds */}
+          <div
+            className={`p-3.5 space-y-1 ${
+              withdrawalInfo.portalFinalized || canFinalizeNow
+                ? 'bg-emerald-50/40'
+                : 'bg-slate-50/40'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="font-semibold text-slate-900">
+                STEP 3 · L1 資金受け取り (Finalize)
+              </span>
+              <span
+                className={`font-bold whitespace-nowrap ${
+                  withdrawalInfo.portalFinalized || canFinalizeNow
+                    ? 'text-emerald-700'
+                    : 'text-slate-600'
+                }`}
+              >
+                {withdrawalInfo.portalFinalized
+                  ? '受取完了 ✓'
+                  : canFinalizeNow
+                  ? '今すぐ受取可 ✓'
+                  : '待機中'}
+              </span>
+            </div>
+            <div className="text-[11px] font-mono tabular-nums text-slate-700">
+              {withdrawalInfo.portalFinalized
+                ? 'finalizedWithdrawals = true'
+                : canFinalizeNow
+                ? '全待機期間クリア · 着金実行可能'
+                : proveMeta.isProven
+                ? `ゲーム解決残り: ${formatSecondsJapanese(liveGameRemSec)}`
+                : 'STEP 2 の Prove 提出後にカウント開始'}
+            </div>
+            <div className="text-[11px] font-mono text-slate-500 truncate">
+              L1受取先: {shortenHex(withdrawalInfo.l1Recipient, 8, 6)}
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Section 1: DisputeGame TEE / ZK Multi-Proof Check & 1-Day vs 5-Day Window */}
       <div className="p-4 sm:p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
           <div>
             <h3 className="text-sm font-bold text-slate-900">
-              出金ゲーム (DisputeGame) TEE / ZK 証明状態 ＆ 1日 / 5日 待機期間チェック
+              ブロック検証ゲーム (DisputeGame) の TEE / ZK 証明状態 ＆ 1日 / 5日 待機期間チェック
             </h3>
             <p className="mt-0.5 text-xs text-slate-600 leading-relaxed">
-              Base L1 <span className="font-mono">AggregateVerifier</span>{' '}
-              の待機期間は、<strong>単一証明（TEEのみ / ZKのみ）で 5日（432,000秒）</strong>、
-              <strong>TEE と ZK の両方がある場合は 1日（86,400秒）</strong> に短縮されます。
+              ※ こちらはネットワーク側のブロック検証証明（待機期間を決める条件）です。
+              <strong>単一証明（TEEのみ / ZKのみ）は 5日（432,000秒）</strong>、
+              <strong>TEE と ZK の両方がある場合は 1日（86,400秒）</strong> になります。
             </p>
           </div>
 
           <button
             type="button"
             onClick={handleCheckTeeZk}
-            disabled={isCheckingTeeZk}
+            disabled={isCheckingTeeZk || isCheckingProveStatus}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#0052FF] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
           >
             <RefreshCw

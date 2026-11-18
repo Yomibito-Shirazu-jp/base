@@ -1,0 +1,6 @@
+{
+  "name": "Base Finality — オンチェーン一括検証ツール",
+  "description": "Base (OP Stack) のトランザクションハッシュを一括入力し、オンチェーンJSON-RPCからFinalized / Safe / Unsafeのファイナライズ状態を直接検証する監査コンソール。",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
